@@ -1,0 +1,695 @@
+//! Lowering from syn AST to HIR
+
+use crate::error::Span;
+use crate::hir::*;
+use crate::parser::Parser;
+use std::sync::atomic::Ordering;
+use syn::spanned::Spanned;
+
+pub struct Lowerer<'a> {
+    parser: &'a Parser,
+    file_id: u32,
+}
+
+impl<'a> Lowerer<'a> {
+    pub fn new(parser: &'a Parser, file_id: u32) -> Self {
+        Self { parser, file_id }
+    }
+
+    fn span(&self, _s: proc_macro2::Span) -> Span {
+        // Use dummy span - proc_macro2 span position requires special features
+        Span::new(self.file_id, 0, 0)
+    }
+
+    fn alloc_def_id(&self) -> DefId {
+        self.parser.next_def_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub fn lower_file(&self, file: &syn::File, krate: &mut Crate) {
+        for item in &file.items {
+            if let Some(hir_item) = self.lower_item(item) {
+                let id = hir_item.id;
+                if let ItemKind::Function(ref f) = hir_item.kind {
+                    if hir_item.name == "main" && f.sig.inputs.is_empty() {
+                        krate.entry_point = Some(id);
+                    }
+                }
+                krate.items.insert(id, hir_item);
+            }
+        }
+    }
+
+    fn lower_item(&self, item: &syn::Item) -> Option<Item> {
+        match item {
+            syn::Item::Fn(f) => Some(self.lower_fn(f)),
+            syn::Item::Struct(s) => Some(self.lower_struct(s)),
+            syn::Item::Enum(e) => Some(self.lower_enum(e)),
+            syn::Item::Const(c) => Some(self.lower_const(c)),
+            syn::Item::Static(s) => Some(self.lower_static(s)),
+            syn::Item::Impl(i) => Some(self.lower_impl(i)),
+            syn::Item::Trait(t) => Some(self.lower_trait(t)),
+            syn::Item::Type(t) => Some(self.lower_type_alias(t)),
+            syn::Item::Mod(m) => Some(self.lower_mod(m)),
+            syn::Item::Use(_) => None,
+            syn::Item::ExternCrate(_) => None,
+            _ => None,
+        }
+    }
+
+    fn lower_fn(&self, f: &syn::ItemFn) -> Item {
+        let id = self.alloc_def_id();
+        let name = f.sig.ident.to_string();
+
+        let inputs = f
+            .sig
+            .inputs
+            .iter()
+            .filter_map(|arg| {
+                if let syn::FnArg::Typed(pat_ty) = arg {
+                    let name = if let syn::Pat::Ident(pi) = &*pat_ty.pat {
+                        pi.ident.to_string()
+                    } else {
+                        "_".to_string()
+                    };
+                    Some((name, self.lower_type(&pat_ty.ty)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let output = match &f.sig.output {
+            syn::ReturnType::Default => Type {
+                kind: TypeKind::Unit,
+                span: Span::dummy(),
+            },
+            syn::ReturnType::Type(_, ty) => self.lower_type(ty),
+        };
+
+        let sig = FnSig {
+            inputs,
+            output,
+            generics: self.lower_generics(&f.sig.generics),
+        };
+
+        let body = Some(self.lower_block(&f.block));
+
+        Item {
+            id,
+            name,
+            kind: ItemKind::Function(Function {
+                sig,
+                body,
+                is_async: f.sig.asyncness.is_some(),
+                is_const: f.sig.constness.is_some(),
+                is_unsafe: f.sig.unsafety.is_some(),
+            }),
+            visibility: self.lower_visibility(&f.vis),
+            span: self.span(f.span()),
+        }
+    }
+
+    fn lower_struct(&self, s: &syn::ItemStruct) -> Item {
+        let id = self.alloc_def_id();
+        let name = s.ident.to_string();
+
+        let kind = match &s.fields {
+            syn::Fields::Unit => StructKind::Unit,
+            syn::Fields::Unnamed(fields) => {
+                StructKind::Tuple(fields.unnamed.iter().map(|f| self.lower_type(&f.ty)).collect())
+            }
+            syn::Fields::Named(fields) => StructKind::Named(
+                fields
+                    .named
+                    .iter()
+                    .map(|f| Field {
+                        name: f.ident.as_ref().map(|i| i.to_string()).unwrap_or_default(),
+                        ty: self.lower_type(&f.ty),
+                        visibility: self.lower_visibility(&f.vis),
+                    })
+                    .collect(),
+            ),
+        };
+
+        Item {
+            id,
+            name,
+            kind: ItemKind::Struct(Struct {
+                generics: self.lower_generics(&s.generics),
+                kind,
+            }),
+            visibility: self.lower_visibility(&s.vis),
+            span: self.span(s.span()),
+        }
+    }
+
+    fn lower_enum(&self, e: &syn::ItemEnum) -> Item {
+        let id = self.alloc_def_id();
+        let name = e.ident.to_string();
+
+        let variants = e
+            .variants
+            .iter()
+            .map(|v| {
+                let kind = match &v.fields {
+                    syn::Fields::Unit => StructKind::Unit,
+                    syn::Fields::Unnamed(fields) => {
+                        StructKind::Tuple(fields.unnamed.iter().map(|f| self.lower_type(&f.ty)).collect())
+                    }
+                    syn::Fields::Named(fields) => StructKind::Named(
+                        fields
+                            .named
+                            .iter()
+                            .map(|f| Field {
+                                name: f.ident.as_ref().map(|i| i.to_string()).unwrap_or_default(),
+                                ty: self.lower_type(&f.ty),
+                                visibility: Visibility::Public,
+                            })
+                            .collect(),
+                    ),
+                };
+
+                Variant {
+                    name: v.ident.to_string(),
+                    kind,
+                    discriminant: v.discriminant.as_ref().map(|(_, expr)| self.lower_expr(expr)),
+                }
+            })
+            .collect();
+
+        Item {
+            id,
+            name,
+            kind: ItemKind::Enum(Enum {
+                generics: self.lower_generics(&e.generics),
+                variants,
+            }),
+            visibility: self.lower_visibility(&e.vis),
+            span: self.span(e.span()),
+        }
+    }
+
+    fn lower_const(&self, c: &syn::ItemConst) -> Item {
+        let id = self.alloc_def_id();
+        Item {
+            id,
+            name: c.ident.to_string(),
+            kind: ItemKind::Const(Const {
+                ty: self.lower_type(&c.ty),
+                value: self.lower_expr(&c.expr),
+            }),
+            visibility: self.lower_visibility(&c.vis),
+            span: self.span(c.span()),
+        }
+    }
+
+    fn lower_static(&self, s: &syn::ItemStatic) -> Item {
+        let id = self.alloc_def_id();
+        Item {
+            id,
+            name: s.ident.to_string(),
+            kind: ItemKind::Static(Static {
+                ty: self.lower_type(&s.ty),
+                value: self.lower_expr(&s.expr),
+                mutable: matches!(s.mutability, syn::StaticMutability::Mut(_)),
+            }),
+            visibility: self.lower_visibility(&s.vis),
+            span: self.span(s.span()),
+        }
+    }
+
+    fn lower_impl(&self, i: &syn::ItemImpl) -> Item {
+        let id = self.alloc_def_id();
+
+        let trait_ref = i.trait_.as_ref().map(|(_, path, _)| self.lower_path(path));
+        let self_ty = self.lower_type(&i.self_ty);
+
+        let items = i
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                syn::ImplItem::Fn(f) => Some(self.alloc_def_id()),
+                _ => None,
+            })
+            .collect();
+
+        Item {
+            id,
+            name: String::new(),
+            kind: ItemKind::Impl(Impl {
+                generics: self.lower_generics(&i.generics),
+                trait_ref,
+                self_ty,
+                items,
+            }),
+            visibility: Visibility::Private,
+            span: self.span(i.span()),
+        }
+    }
+
+    fn lower_trait(&self, t: &syn::ItemTrait) -> Item {
+        let id = self.alloc_def_id();
+        Item {
+            id,
+            name: t.ident.to_string(),
+            kind: ItemKind::Trait(Trait {
+                generics: self.lower_generics(&t.generics),
+                bounds: t.supertraits.iter().filter_map(|b| self.lower_type_param_bound(b)).collect(),
+                items: Vec::new(),
+            }),
+            visibility: self.lower_visibility(&t.vis),
+            span: self.span(t.span()),
+        }
+    }
+
+    fn lower_type_alias(&self, t: &syn::ItemType) -> Item {
+        let id = self.alloc_def_id();
+        Item {
+            id,
+            name: t.ident.to_string(),
+            kind: ItemKind::TypeAlias(TypeAlias {
+                generics: self.lower_generics(&t.generics),
+                ty: self.lower_type(&t.ty),
+            }),
+            visibility: self.lower_visibility(&t.vis),
+            span: self.span(t.span()),
+        }
+    }
+
+    fn lower_mod(&self, m: &syn::ItemMod) -> Item {
+        let id = self.alloc_def_id();
+        Item {
+            id,
+            name: m.ident.to_string(),
+            kind: ItemKind::Module(Module { items: Vec::new() }),
+            visibility: self.lower_visibility(&m.vis),
+            span: self.span(m.span()),
+        }
+    }
+
+    fn lower_generics(&self, g: &syn::Generics) -> Generics {
+        let params = g
+            .params
+            .iter()
+            .map(|p| match p {
+                syn::GenericParam::Type(tp) => GenericParam::Type {
+                    name: tp.ident.to_string(),
+                    bounds: tp.bounds.iter().filter_map(|b| self.lower_type_param_bound(b)).collect(),
+                },
+                syn::GenericParam::Lifetime(lp) => GenericParam::Lifetime {
+                    name: lp.lifetime.ident.to_string(),
+                },
+                syn::GenericParam::Const(cp) => GenericParam::Const {
+                    name: cp.ident.to_string(),
+                    ty: self.lower_type(&cp.ty),
+                },
+            })
+            .collect();
+
+        Generics {
+            params,
+            where_clause: Vec::new(),
+        }
+    }
+
+    fn lower_type_param_bound(&self, bound: &syn::TypeParamBound) -> Option<TypeBound> {
+        match bound {
+            syn::TypeParamBound::Trait(tb) => Some(TypeBound::Trait(self.lower_path(&tb.path))),
+            syn::TypeParamBound::Lifetime(lt) => Some(TypeBound::Lifetime(lt.ident.to_string())),
+            _ => None,
+        }
+    }
+
+    fn lower_visibility(&self, vis: &syn::Visibility) -> Visibility {
+        match vis {
+            syn::Visibility::Public(_) => Visibility::Public,
+            syn::Visibility::Restricted(r) => {
+                if r.path.is_ident("crate") {
+                    Visibility::Crate
+                } else if r.path.is_ident("super") {
+                    Visibility::Super
+                } else {
+                    Visibility::Private
+                }
+            }
+            syn::Visibility::Inherited => Visibility::Private,
+        }
+    }
+
+    fn lower_type(&self, ty: &syn::Type) -> Type {
+        let kind = match ty {
+            syn::Type::Path(tp) => {
+                if tp.qself.is_none() && tp.path.segments.len() == 1 {
+                    let seg = &tp.path.segments[0];
+                    let ident = seg.ident.to_string();
+                    match ident.as_str() {
+                        "bool" => TypeKind::Bool,
+                        "char" => TypeKind::Char,
+                        "str" => TypeKind::Str,
+                        "i8" => TypeKind::Int(IntType::I8),
+                        "i16" => TypeKind::Int(IntType::I16),
+                        "i32" => TypeKind::Int(IntType::I32),
+                        "i64" => TypeKind::Int(IntType::I64),
+                        "i128" => TypeKind::Int(IntType::I128),
+                        "isize" => TypeKind::Int(IntType::Isize),
+                        "u8" => TypeKind::Uint(UintType::U8),
+                        "u16" => TypeKind::Uint(UintType::U16),
+                        "u32" => TypeKind::Uint(UintType::U32),
+                        "u64" => TypeKind::Uint(UintType::U64),
+                        "u128" => TypeKind::Uint(UintType::U128),
+                        "usize" => TypeKind::Uint(UintType::Usize),
+                        "f32" => TypeKind::Float(FloatType::F32),
+                        "f64" => TypeKind::Float(FloatType::F64),
+                        _ => TypeKind::Path(self.lower_path(&tp.path)),
+                    }
+                } else {
+                    TypeKind::Path(self.lower_path(&tp.path))
+                }
+            }
+            syn::Type::Reference(r) => TypeKind::Ref {
+                lifetime: r.lifetime.as_ref().map(|lt| lt.ident.to_string()),
+                mutable: r.mutability.is_some(),
+                inner: Box::new(self.lower_type(&r.elem)),
+            },
+            syn::Type::Ptr(p) => TypeKind::Ptr {
+                mutable: p.mutability.is_some(),
+                inner: Box::new(self.lower_type(&p.elem)),
+            },
+            syn::Type::Slice(s) => TypeKind::Slice(Box::new(self.lower_type(&s.elem))),
+            syn::Type::Array(a) => TypeKind::Array {
+                elem: Box::new(self.lower_type(&a.elem)),
+                len: 0,
+            },
+            syn::Type::Tuple(t) => {
+                if t.elems.is_empty() {
+                    TypeKind::Unit
+                } else {
+                    TypeKind::Tuple(t.elems.iter().map(|e| self.lower_type(e)).collect())
+                }
+            }
+            syn::Type::Never(_) => TypeKind::Never,
+            syn::Type::Infer(_) => TypeKind::Infer,
+            _ => TypeKind::Error,
+        };
+
+        Type {
+            kind,
+            span: self.span(ty.span()),
+        }
+    }
+
+    fn lower_path(&self, path: &syn::Path) -> Path {
+        Path {
+            segments: path
+                .segments
+                .iter()
+                .map(|seg| PathSegment {
+                    ident: seg.ident.to_string(),
+                    args: match &seg.arguments {
+                        syn::PathArguments::None => None,
+                        syn::PathArguments::AngleBracketed(args) => Some(GenericArgs {
+                            args: args
+                                .args
+                                .iter()
+                                .filter_map(|arg| match arg {
+                                    syn::GenericArgument::Type(ty) => {
+                                        Some(GenericArg::Type(self.lower_type(ty)))
+                                    }
+                                    syn::GenericArgument::Lifetime(lt) => {
+                                        Some(GenericArg::Lifetime(lt.ident.to_string()))
+                                    }
+                                    _ => None,
+                                })
+                                .collect(),
+                        }),
+                        syn::PathArguments::Parenthesized(_) => None,
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    fn lower_block(&self, block: &syn::Block) -> Block {
+        let mut stmts = Vec::new();
+        let mut final_expr = None;
+
+        for (i, stmt) in block.stmts.iter().enumerate() {
+            let is_last = i == block.stmts.len() - 1;
+
+            match stmt {
+                syn::Stmt::Local(local) => {
+                    stmts.push(Stmt {
+                        kind: StmtKind::Let {
+                            pattern: self.lower_pattern(&local.pat),
+                            ty: None, // syn 2.0 type is inferred from init
+                            init: local.init.as_ref().map(|init| self.lower_expr(&init.expr)),
+                        },
+                        span: self.span(local.span()),
+                    });
+                }
+                syn::Stmt::Item(_) => {}
+                syn::Stmt::Expr(expr, semi) => {
+                    if is_last && semi.is_none() {
+                        final_expr = Some(Box::new(self.lower_expr(expr)));
+                    } else if semi.is_some() {
+                        stmts.push(Stmt {
+                            kind: StmtKind::Semi(self.lower_expr(expr)),
+                            span: self.span(expr.span()),
+                        });
+                    } else {
+                        stmts.push(Stmt {
+                            kind: StmtKind::Expr(self.lower_expr(expr)),
+                            span: self.span(expr.span()),
+                        });
+                    }
+                }
+                syn::Stmt::Macro(m) => {
+                    stmts.push(Stmt {
+                        kind: StmtKind::Expr(Expr {
+                            kind: ExprKind::Err,
+                            ty: None,
+                            span: self.span(m.span()),
+                        }),
+                        span: self.span(m.span()),
+                    });
+                }
+            }
+        }
+
+        Block {
+            stmts,
+            expr: final_expr,
+            span: self.span(block.span()),
+        }
+    }
+
+    fn lower_pattern(&self, pat: &syn::Pat) -> Pattern {
+        let kind = match pat {
+            syn::Pat::Wild(_) => PatternKind::Wild,
+            syn::Pat::Ident(pi) => PatternKind::Ident {
+                mutable: pi.mutability.is_some(),
+                name: pi.ident.to_string(),
+                binding: pi.subpat.as_ref().map(|(_, p)| Box::new(self.lower_pattern(p))),
+            },
+            syn::Pat::Tuple(t) => {
+                PatternKind::Tuple(t.elems.iter().map(|p| self.lower_pattern(p)).collect())
+            }
+            syn::Pat::TupleStruct(ts) => PatternKind::TupleStruct {
+                path: self.lower_path(&ts.path),
+                elems: ts.elems.iter().map(|p| self.lower_pattern(p)).collect(),
+            },
+            syn::Pat::Struct(s) => PatternKind::Struct {
+                path: self.lower_path(&s.path),
+                fields: s
+                    .fields
+                    .iter()
+                    .map(|fp| FieldPattern {
+                        name: fp.member.to_token_stream().to_string(),
+                        pattern: self.lower_pattern(&fp.pat),
+                    })
+                    .collect(),
+                rest: s.rest.is_some(),
+            },
+            syn::Pat::Path(pp) => PatternKind::Path(self.lower_path(&pp.path)),
+            syn::Pat::Lit(lit) => PatternKind::Lit(self.lower_lit(&lit.lit)),
+            syn::Pat::Or(or) => {
+                PatternKind::Or(or.cases.iter().map(|p| self.lower_pattern(p)).collect())
+            }
+            syn::Pat::Reference(r) => PatternKind::Ref {
+                mutable: r.mutability.is_some(),
+                pattern: Box::new(self.lower_pattern(&r.pat)),
+            },
+            _ => PatternKind::Wild,
+        };
+
+        Pattern {
+            kind,
+            span: self.span(pat.span()),
+        }
+    }
+
+    fn lower_expr(&self, expr: &syn::Expr) -> Expr {
+        let span = self.span(expr.span());
+        let kind = match expr {
+            syn::Expr::Lit(lit) => ExprKind::Lit(self.lower_lit(&lit.lit)),
+            syn::Expr::Path(p) => ExprKind::Path(self.lower_path(&p.path)),
+            syn::Expr::Unary(u) => ExprKind::Unary {
+                op: match u.op {
+                    syn::UnOp::Not(_) => UnaryOp::Not,
+                    syn::UnOp::Neg(_) => UnaryOp::Neg,
+                    syn::UnOp::Deref(_) => {
+                        return Expr {
+                            kind: ExprKind::Deref(Box::new(self.lower_expr(&u.expr))),
+                            ty: None,
+                            span,
+                        };
+                    }
+                    _ => UnaryOp::Not,
+                },
+                expr: Box::new(self.lower_expr(&u.expr)),
+            },
+            syn::Expr::Binary(b) => ExprKind::Binary {
+                op: self.lower_binop(&b.op),
+                lhs: Box::new(self.lower_expr(&b.left)),
+                rhs: Box::new(self.lower_expr(&b.right)),
+            },
+            syn::Expr::Assign(a) => ExprKind::Assign {
+                lhs: Box::new(self.lower_expr(&a.left)),
+                rhs: Box::new(self.lower_expr(&a.right)),
+            },
+            syn::Expr::Index(i) => ExprKind::Index {
+                expr: Box::new(self.lower_expr(&i.expr)),
+                index: Box::new(self.lower_expr(&i.index)),
+            },
+            syn::Expr::Field(f) => ExprKind::Field {
+                expr: Box::new(self.lower_expr(&f.base)),
+                field: f.member.to_token_stream().to_string(),
+            },
+            syn::Expr::Call(c) => ExprKind::Call {
+                func: Box::new(self.lower_expr(&c.func)),
+                args: c.args.iter().map(|a| self.lower_expr(a)).collect(),
+            },
+            syn::Expr::MethodCall(m) => ExprKind::MethodCall {
+                receiver: Box::new(self.lower_expr(&m.receiver)),
+                method: m.method.to_string(),
+                args: m.args.iter().map(|a| self.lower_expr(a)).collect(),
+            },
+            syn::Expr::Tuple(t) => {
+                ExprKind::Tuple(t.elems.iter().map(|e| self.lower_expr(e)).collect())
+            }
+            syn::Expr::Array(a) => {
+                ExprKind::Array(a.elems.iter().map(|e| self.lower_expr(e)).collect())
+            }
+            syn::Expr::If(i) => ExprKind::If {
+                cond: Box::new(self.lower_expr(&i.cond)),
+                then_branch: Box::new(self.lower_block(&i.then_branch)),
+                else_branch: i.else_branch.as_ref().map(|(_, e)| Box::new(self.lower_expr(e))),
+            },
+            syn::Expr::Match(m) => ExprKind::Match {
+                expr: Box::new(self.lower_expr(&m.expr)),
+                arms: m
+                    .arms
+                    .iter()
+                    .map(|arm| Arm {
+                        pattern: self.lower_pattern(&arm.pat),
+                        guard: arm.guard.as_ref().map(|(_, e)| Box::new(self.lower_expr(e))),
+                        body: Box::new(self.lower_expr(&arm.body)),
+                    })
+                    .collect(),
+            },
+            syn::Expr::Loop(l) => ExprKind::Loop {
+                body: Box::new(self.lower_block(&l.body)),
+                label: l.label.as_ref().map(|l| l.name.ident.to_string()),
+            },
+            syn::Expr::While(w) => ExprKind::While {
+                cond: Box::new(self.lower_expr(&w.cond)),
+                body: Box::new(self.lower_block(&w.body)),
+                label: w.label.as_ref().map(|l| l.name.ident.to_string()),
+            },
+            syn::Expr::ForLoop(f) => ExprKind::For {
+                pattern: self.lower_pattern(&f.pat),
+                iter: Box::new(self.lower_expr(&f.expr)),
+                body: Box::new(self.lower_block(&f.body)),
+                label: f.label.as_ref().map(|l| l.name.ident.to_string()),
+            },
+            syn::Expr::Block(b) => ExprKind::Block(Box::new(self.lower_block(&b.block))),
+            syn::Expr::Return(r) => {
+                ExprKind::Return(r.expr.as_ref().map(|e| Box::new(self.lower_expr(e))))
+            }
+            syn::Expr::Break(b) => ExprKind::Break {
+                label: b.label.as_ref().map(|l| l.ident.to_string()),
+                value: b.expr.as_ref().map(|e| Box::new(self.lower_expr(e))),
+            },
+            syn::Expr::Continue(c) => ExprKind::Continue(c.label.as_ref().map(|l| l.ident.to_string())),
+            syn::Expr::Reference(r) => ExprKind::Ref {
+                mutable: r.mutability.is_some(),
+                expr: Box::new(self.lower_expr(&r.expr)),
+            },
+            syn::Expr::Cast(c) => ExprKind::Cast {
+                expr: Box::new(self.lower_expr(&c.expr)),
+                ty: self.lower_type(&c.ty),
+            },
+            syn::Expr::Closure(c) => ExprKind::Closure {
+                params: c
+                    .inputs
+                    .iter()
+                    .map(|p| (self.lower_pattern(p), None))
+                    .collect(),
+                body: Box::new(self.lower_expr(&c.body)),
+                is_async: c.asyncness.is_some(),
+                is_move: c.capture.is_some(),
+            },
+            syn::Expr::Await(a) => ExprKind::Await(Box::new(self.lower_expr(&a.base))),
+            syn::Expr::Try(t) => ExprKind::Try(Box::new(self.lower_expr(&t.expr))),
+            syn::Expr::Paren(p) => return self.lower_expr(&p.expr),
+            syn::Expr::Macro(_) => ExprKind::Err,
+            _ => ExprKind::Err,
+        };
+
+        Expr { kind, ty: None, span }
+    }
+
+    fn lower_lit(&self, lit: &syn::Lit) -> Literal {
+        match lit {
+            syn::Lit::Bool(b) => Literal::Bool(b.value),
+            syn::Lit::Char(c) => Literal::Char(c.value()),
+            syn::Lit::Int(i) => {
+                let value = i.base10_parse::<i128>().unwrap_or(0);
+                Literal::Int(value, None)
+            }
+            syn::Lit::Float(f) => {
+                let value = f.base10_parse::<f64>().unwrap_or(0.0);
+                Literal::Float(value, None)
+            }
+            syn::Lit::Str(s) => Literal::Str(s.value()),
+            syn::Lit::ByteStr(b) => Literal::ByteStr(b.value()),
+            _ => Literal::Bool(false),
+        }
+    }
+
+    fn lower_binop(&self, op: &syn::BinOp) -> BinaryOp {
+        match op {
+            syn::BinOp::Add(_) | syn::BinOp::AddAssign(_) => BinaryOp::Add,
+            syn::BinOp::Sub(_) | syn::BinOp::SubAssign(_) => BinaryOp::Sub,
+            syn::BinOp::Mul(_) | syn::BinOp::MulAssign(_) => BinaryOp::Mul,
+            syn::BinOp::Div(_) | syn::BinOp::DivAssign(_) => BinaryOp::Div,
+            syn::BinOp::Rem(_) | syn::BinOp::RemAssign(_) => BinaryOp::Rem,
+            syn::BinOp::And(_) => BinaryOp::And,
+            syn::BinOp::Or(_) => BinaryOp::Or,
+            syn::BinOp::BitAnd(_) | syn::BinOp::BitAndAssign(_) => BinaryOp::BitAnd,
+            syn::BinOp::BitOr(_) | syn::BinOp::BitOrAssign(_) => BinaryOp::BitOr,
+            syn::BinOp::BitXor(_) | syn::BinOp::BitXorAssign(_) => BinaryOp::BitXor,
+            syn::BinOp::Shl(_) | syn::BinOp::ShlAssign(_) => BinaryOp::Shl,
+            syn::BinOp::Shr(_) | syn::BinOp::ShrAssign(_) => BinaryOp::Shr,
+            syn::BinOp::Eq(_) => BinaryOp::Eq,
+            syn::BinOp::Ne(_) => BinaryOp::Ne,
+            syn::BinOp::Lt(_) => BinaryOp::Lt,
+            syn::BinOp::Le(_) => BinaryOp::Le,
+            syn::BinOp::Gt(_) => BinaryOp::Gt,
+            syn::BinOp::Ge(_) => BinaryOp::Ge,
+            _ => BinaryOp::Add,
+        }
+    }
+}
+
+use quote::ToTokens;
