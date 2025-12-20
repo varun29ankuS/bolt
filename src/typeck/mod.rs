@@ -366,10 +366,10 @@ impl<'a> TypeChecker<'a> {
             Literal::Bool(_) => ResolvedType::Bool,
             Literal::Char(_) => ResolvedType::Char,
             Literal::Int(_, suffix) => {
-                suffix.map(ResolvedType::Int).unwrap_or(ResolvedType::Int(IntType::I32))
+                suffix.map(ResolvedType::Int).unwrap_or_else(|| self.ctx.fresh_infer())
             }
             Literal::Uint(_, suffix) => {
-                suffix.map(ResolvedType::Uint).unwrap_or(ResolvedType::Uint(UintType::U32))
+                suffix.map(ResolvedType::Uint).unwrap_or_else(|| self.ctx.fresh_infer())
             }
             Literal::Float(_, suffix) => {
                 suffix.map(ResolvedType::Float).unwrap_or(ResolvedType::Float(FloatType::F64))
