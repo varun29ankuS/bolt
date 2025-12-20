@@ -21,6 +21,7 @@ pub struct CodeGenerator {
     module: JITModule,
     ctx: codegen::Context,
     func_ids: HashMap<DefId, FuncId>,
+    func_names: HashMap<String, FuncId>,
 }
 
 impl CodeGenerator {
@@ -46,6 +47,7 @@ impl CodeGenerator {
             module,
             ctx,
             func_ids: HashMap::new(),
+            func_names: HashMap::new(),
         })
     }
 
@@ -84,6 +86,7 @@ impl CodeGenerator {
             .map_err(|e| BoltError::Codegen { message: format!("Failed to declare {}: {}", name, e) })?;
 
         self.func_ids.insert(def_id, func_id);
+        self.func_names.insert(name.to_string(), func_id);
         Ok(())
     }
 
@@ -105,7 +108,7 @@ impl CodeGenerator {
             .map(|i| builder.block_params(entry_block)[i])
             .collect();
 
-        let mut translator = FunctionTranslator::new(builder, &self.func_ids, &self.module);
+        let mut translator = FunctionTranslator::new(builder, &self.func_ids, &self.func_names, &mut self.module);
 
         for ((param_name, _), val) in func.sig.inputs.iter().zip(param_values) {
             translator.locals.insert(param_name.clone(), val);
@@ -178,7 +181,8 @@ impl CodeGenerator {
 struct FunctionTranslator<'a, 'b> {
     builder: FunctionBuilder<'b>,
     func_ids: &'a HashMap<DefId, FuncId>,
-    module: &'a JITModule,
+    func_names: &'a HashMap<String, FuncId>,
+    module: &'a mut JITModule,
     locals: IndexMap<String, Value>,
 }
 
@@ -186,11 +190,13 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
     fn new(
         builder: FunctionBuilder<'b>,
         func_ids: &'a HashMap<DefId, FuncId>,
-        module: &'a JITModule,
+        func_names: &'a HashMap<String, FuncId>,
+        module: &'a mut JITModule,
     ) -> Self {
         Self {
             builder,
             func_ids,
+            func_names,
             module,
             locals: IndexMap::new(),
         }
@@ -299,6 +305,28 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                 self.builder.ins().iconst(types::I64, 0)
             }
             ExprKind::Call { func, args } => {
+                // Try to resolve function name from path
+                if let ExprKind::Path(path) = &func.kind {
+                    if path.segments.len() == 1 {
+                        let name = &path.segments[0].ident;
+                        if let Some(&func_id) = self.func_names.get(name) {
+                            // Get function reference
+                            let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                            
+                            // Translate arguments
+                            let arg_vals: Vec<Value> = args.iter()
+                                .map(|arg| self.translate_expr(arg))
+                                .collect();
+                            
+                            // Emit call
+                            let call = self.builder.ins().call(func_ref, &arg_vals);
+                            let results = self.builder.inst_results(call);
+                            if !results.is_empty() {
+                                return results[0];
+                            }
+                        }
+                    }
+                }
                 self.builder.ins().iconst(types::I64, 0)
             }
             ExprKind::Tuple(elems) => {
