@@ -5,23 +5,31 @@
 use crate::error::{BoltError, Result};
 use crate::hir::{
     self, BinaryOp, Block as HirBlock, Crate, DefId, Expr, ExprKind, FloatType, Function,
-    IntType, ItemKind, Literal, Pattern, PatternKind, Stmt, StmtKind, Type as HirType,
-    TypeKind, UintType, UnaryOp,
+    IntType, ItemKind, Literal, Pattern, PatternKind, Stmt, StmtKind, Struct, StructKind,
+    Type as HirType, TypeKind, UintType, UnaryOp,
 };
 use cranelift::prelude::{
-    codegen, settings, types, AbiParam, Configurable, FunctionBuilder, FunctionBuilderContext,
-    InstBuilder, IntCC, Value,
+    codegen, settings, types, AbiParam, Block, Configurable, FunctionBuilder, FunctionBuilderContext,
+    InstBuilder, IntCC, Value, Variable,
 };
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 use indexmap::IndexMap;
 use std::collections::HashMap;
 
+/// Field offset information for a struct
+#[derive(Clone)]
+struct StructLayout {
+    fields: IndexMap<String, usize>,  // field name -> offset
+    size: usize,
+}
+
 pub struct CodeGenerator {
     module: JITModule,
     ctx: codegen::Context,
     func_ids: HashMap<DefId, FuncId>,
     func_names: HashMap<String, FuncId>,
+    struct_layouts: HashMap<String, StructLayout>,
 }
 
 impl CodeGenerator {
@@ -48,10 +56,18 @@ impl CodeGenerator {
             ctx,
             func_ids: HashMap::new(),
             func_names: HashMap::new(),
+            struct_layouts: HashMap::new(),
         })
     }
 
     pub fn compile_crate(&mut self, krate: &Crate) -> Result<()> {
+        // Collect struct layouts
+        for (_, item) in &krate.items {
+            if let ItemKind::Struct(s) = &item.kind {
+                self.register_struct(&item.name, s);
+            }
+        }
+        
         for (def_id, item) in &krate.items {
             if let ItemKind::Function(f) = &item.kind {
                 self.declare_function(*def_id, &item.name, f)?;
@@ -69,6 +85,20 @@ impl CodeGenerator {
         })?;
 
         Ok(())
+    }
+
+    fn register_struct(&mut self, name: &str, s: &Struct) {
+        let mut fields = IndexMap::new();
+        let mut offset = 0usize;
+        
+        if let StructKind::Named(ref field_list) = s.kind {
+            for field in field_list {
+                fields.insert(field.name.clone(), offset);
+                offset += 8;  // All fields are 8 bytes for now
+            }
+        }
+        
+        self.struct_layouts.insert(name.to_string(), StructLayout { fields, size: offset });
     }
 
     fn declare_function(&mut self, def_id: DefId, name: &str, func: &Function) -> Result<()> {
@@ -108,10 +138,14 @@ impl CodeGenerator {
             .map(|i| builder.block_params(entry_block)[i])
             .collect();
 
-        let mut translator = FunctionTranslator::new(builder, &self.func_ids, &self.func_names, &mut self.module);
+        let mut translator = FunctionTranslator::new(builder, &self.func_ids, &self.func_names, &mut self.module, &self.struct_layouts);
 
         for ((param_name, _), val) in func.sig.inputs.iter().zip(param_values) {
-            translator.locals.insert(param_name.clone(), val);
+            let var = Variable::from_u32(translator.next_var as u32);
+            translator.next_var += 1;
+            translator.builder.declare_var(var, types::I64);
+            translator.builder.def_var(var, val);
+            translator.locals.insert(param_name.clone(), var);
         }
 
         if let Some(ref body) = func.body {
@@ -183,7 +217,10 @@ struct FunctionTranslator<'a, 'b> {
     func_ids: &'a HashMap<DefId, FuncId>,
     func_names: &'a HashMap<String, FuncId>,
     module: &'a mut JITModule,
-    locals: IndexMap<String, Value>,
+    struct_layouts: &'a HashMap<String, StructLayout>,
+    locals: IndexMap<String, Variable>,
+    next_var: usize,
+    loop_stack: Vec<(Block, Block)>,
 }
 
 impl<'a, 'b> FunctionTranslator<'a, 'b> {
@@ -192,13 +229,17 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
         func_ids: &'a HashMap<DefId, FuncId>,
         func_names: &'a HashMap<String, FuncId>,
         module: &'a mut JITModule,
+        struct_layouts: &'a HashMap<String, StructLayout>,
     ) -> Self {
         Self {
             builder,
             func_ids,
             func_names,
             module,
+            struct_layouts,
             locals: IndexMap::new(),
+            next_var: 0,
+            loop_stack: Vec::new(),
         }
     }
 
@@ -231,7 +272,11 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
 
     fn bind_pattern(&mut self, pattern: &Pattern, val: Value) {
         if let PatternKind::Ident { name, .. } = &pattern.kind {
-            self.locals.insert(name.clone(), val);
+            let var = Variable::from_u32(self.next_var as u32);
+            self.next_var += 1;
+            self.builder.declare_var(var, types::I64);
+            self.builder.def_var(var, val);
+            self.locals.insert(name.clone(), var);
         }
     }
 
@@ -241,8 +286,8 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             ExprKind::Path(path) => {
                 if path.segments.len() == 1 {
                     let name = &path.segments[0].ident;
-                    if let Some(&val) = self.locals.get(name) {
-                        return val;
+                    if let Some(&var) = self.locals.get(name) {
+                        return self.builder.use_var(var);
                     }
                 }
                 self.builder.ins().iconst(types::I64, 0)
@@ -251,6 +296,19 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                 let lhs_val = self.translate_expr(lhs);
                 let rhs_val = self.translate_expr(rhs);
                 self.translate_binop(*op, lhs_val, rhs_val)
+            }
+            ExprKind::Assign { lhs, rhs } => {
+                let rhs_val = self.translate_expr(rhs);
+                // Handle simple path assignment
+                if let ExprKind::Path(path) = &lhs.kind {
+                    if path.segments.len() == 1 {
+                        let name = &path.segments[0].ident;
+                        if let Some(&var) = self.locals.get(name) {
+                            self.builder.def_var(var, rhs_val);
+                        }
+                    }
+                }
+                rhs_val
             }
             ExprKind::Unary { op, expr: inner } => {
                 let val = self.translate_expr(inner);
@@ -329,12 +387,257 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                 }
                 self.builder.ins().iconst(types::I64, 0)
             }
+            ExprKind::MethodCall { receiver, method, args } => {
+                let recv_val = self.translate_expr(receiver);
+
+                // Try to find method by searching all Type_method patterns
+                for (name, &func_id) in self.func_names.iter() {
+                    if name.ends_with(&format!("_{}", method)) {
+                        let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+
+                        // Build args: self first, then rest
+                        let mut arg_vals = vec![recv_val];
+                        arg_vals.extend(args.iter().map(|arg| self.translate_expr(arg)));
+
+                        let call = self.builder.ins().call(func_ref, &arg_vals);
+                        let results = self.builder.inst_results(call);
+                        if !results.is_empty() {
+                            return results[0];
+                        }
+                    }
+                }
+                self.builder.ins().iconst(types::I64, 0)
+            }
             ExprKind::Tuple(elems) => {
                 if elems.is_empty() {
                     self.builder.ins().iconst(types::I64, 0)
                 } else {
                     self.translate_expr(&elems[0])
                 }
+            }
+            ExprKind::Loop { body, .. } => {
+                let header_block = self.builder.create_block();
+                let exit_block = self.builder.create_block();
+                self.builder.append_block_param(exit_block, types::I64);
+                
+                self.builder.ins().jump(header_block, &[]);
+                
+                self.builder.switch_to_block(header_block);
+                // Don't seal header yet
+                
+                self.loop_stack.push((header_block, exit_block));
+                self.translate_block(body);
+                self.loop_stack.pop();
+                
+                self.builder.ins().jump(header_block, &[]);
+                
+                // Now seal header after back edge
+                self.builder.seal_block(header_block);
+                
+                self.builder.switch_to_block(exit_block);
+                self.builder.seal_block(exit_block);
+                
+                self.builder.block_params(exit_block)[0]
+            }
+            ExprKind::While { cond, body, .. } => {
+                let header_block = self.builder.create_block();
+                let body_block = self.builder.create_block();
+                let exit_block = self.builder.create_block();
+                
+                self.builder.ins().jump(header_block, &[]);
+                
+                self.builder.switch_to_block(header_block);
+                // Don't seal header yet - back edge not added
+                
+                let cond_val = self.translate_expr(cond);
+                self.builder.ins().brif(cond_val, body_block, &[], exit_block, &[]);
+                
+                self.builder.switch_to_block(body_block);
+                self.builder.seal_block(body_block);
+                
+                self.loop_stack.push((header_block, exit_block));
+                self.translate_block(body);
+                self.loop_stack.pop();
+                
+                self.builder.ins().jump(header_block, &[]);
+                
+                // Now seal header after back edge
+                self.builder.seal_block(header_block);
+                
+                self.builder.switch_to_block(exit_block);
+                self.builder.seal_block(exit_block);
+                
+                self.builder.ins().iconst(types::I64, 0)
+            }
+            ExprKind::Break { value, .. } => {
+                let val = value.as_ref()
+                    .map(|v| self.translate_expr(v))
+                    .unwrap_or_else(|| self.builder.ins().iconst(types::I64, 0));
+                if let Some(&(_, exit_block)) = self.loop_stack.last() {
+                    self.builder.ins().jump(exit_block, &[val]);
+                }
+                self.builder.ins().iconst(types::I64, 0)
+            }
+            ExprKind::Continue { .. } => {
+                if let Some(&(header_block, _)) = self.loop_stack.last() {
+                    self.builder.ins().jump(header_block, &[]);
+                }
+                self.builder.ins().iconst(types::I64, 0)
+            }
+            ExprKind::Struct { path, fields, .. } => {
+                // Get struct name from path
+                if let Some(seg) = path.segments.first() {
+                    let struct_name = &seg.ident;
+                    if let Some(layout) = self.struct_layouts.get(struct_name) {
+                        // Allocate stack slot for struct
+                        let slot = self.builder.create_sized_stack_slot(cranelift::prelude::StackSlotData::new(
+                            cranelift::prelude::StackSlotKind::ExplicitSlot,
+                            layout.size as u32,
+                            0,
+                        ));
+                        let ptr = self.builder.ins().stack_addr(types::I64, slot, 0);
+                        
+                        // Store each field
+                        for (field_name, field_expr) in fields {
+                            if let Some(&offset) = layout.fields.get(field_name) {
+                                let val = self.translate_expr(field_expr);
+                                self.builder.ins().store(
+                                    cranelift::prelude::MemFlags::new(),
+                                    val,
+                                    ptr,
+                                    offset as i32,
+                                );
+                            }
+                        }
+                        
+                        return ptr;
+                    }
+                }
+                self.builder.ins().iconst(types::I64, 0)
+            }
+            ExprKind::Field { expr: base, field } => {
+                let ptr = self.translate_expr(base);
+                // Try to find field offset - for now we'll check all known structs
+                for layout in self.struct_layouts.values() {
+                    if let Some(&offset) = layout.fields.get(field) {
+                        return self.builder.ins().load(
+                            types::I64,
+                            cranelift::prelude::MemFlags::new(),
+                            ptr,
+                            offset as i32,
+                        );
+                    }
+                }
+                self.builder.ins().iconst(types::I64, 0)
+            }
+            ExprKind::Array(elems) => {
+                if elems.is_empty() {
+                    return self.builder.ins().iconst(types::I64, 0);
+                }
+                // Allocate stack slot for array (8 bytes per element)
+                let size = elems.len() * 8;
+                let slot = self.builder.create_sized_stack_slot(cranelift::prelude::StackSlotData::new(
+                    cranelift::prelude::StackSlotKind::ExplicitSlot,
+                    size as u32,
+                    0,
+                ));
+                let ptr = self.builder.ins().stack_addr(types::I64, slot, 0);
+                
+                // Store each element
+                for (i, elem) in elems.iter().enumerate() {
+                    let val = self.translate_expr(elem);
+                    self.builder.ins().store(
+                        cranelift::prelude::MemFlags::new(),
+                        val,
+                        ptr,
+                        (i * 8) as i32,
+                    );
+                }
+                
+                ptr
+            }
+            ExprKind::Index { expr: base, index } => {
+                let ptr = self.translate_expr(base);
+                let idx = self.translate_expr(index);
+                // Calculate offset: idx * 8
+                let eight = self.builder.ins().iconst(types::I64, 8);
+                let offset = self.builder.ins().imul(idx, eight);
+                let addr = self.builder.ins().iadd(ptr, offset);
+                self.builder.ins().load(types::I64, cranelift::prelude::MemFlags::new(), addr, 0)
+            }
+            ExprKind::Match { expr: scrutinee, arms } => {
+                let scrutinee_val = self.translate_expr(scrutinee);
+                
+                let merge_block = self.builder.create_block();
+                self.builder.append_block_param(merge_block, types::I64);
+                
+                // Create blocks for each arm
+                let arm_blocks: Vec<Block> = arms.iter().map(|_| self.builder.create_block()).collect();
+                let fail_block = self.builder.create_block();
+                
+                // Jump to first arm test
+                if !arm_blocks.is_empty() {
+                    self.builder.ins().jump(arm_blocks[0], &[]);
+                } else {
+                    self.builder.ins().jump(fail_block, &[]);
+                }
+                
+                for (i, arm) in arms.iter().enumerate() {
+                    self.builder.switch_to_block(arm_blocks[i]);
+                    self.builder.seal_block(arm_blocks[i]);
+                    
+                    let next_block = if i + 1 < arm_blocks.len() {
+                        arm_blocks[i + 1]
+                    } else {
+                        fail_block
+                    };
+                    
+                    // Check pattern
+                    match &arm.pattern.kind {
+                        PatternKind::Wild => {
+                            // Wildcard matches everything
+                            let result = self.translate_expr(&arm.body);
+                            self.builder.ins().jump(merge_block, &[result]);
+                        }
+                        PatternKind::Lit(lit) => {
+                            let pat_val = self.translate_literal(lit);
+                            let cmp = self.builder.ins().icmp(IntCC::Equal, scrutinee_val, pat_val);
+                            
+                            let body_block = self.builder.create_block();
+                            self.builder.ins().brif(cmp, body_block, &[], next_block, &[]);
+                            
+                            self.builder.switch_to_block(body_block);
+                            self.builder.seal_block(body_block);
+                            let result = self.translate_expr(&arm.body);
+                            self.builder.ins().jump(merge_block, &[result]);
+                        }
+                        PatternKind::Ident { name, .. } => {
+                            // Binding pattern - bind value and execute body
+                            let var = Variable::from_u32(self.next_var as u32);
+                            self.next_var += 1;
+                            self.builder.declare_var(var, types::I64);
+                            self.builder.def_var(var, scrutinee_val);
+                            self.locals.insert(name.clone(), var);
+                            
+                            let result = self.translate_expr(&arm.body);
+                            self.builder.ins().jump(merge_block, &[result]);
+                        }
+                        _ => {
+                            // Unsupported pattern, try next arm
+                            self.builder.ins().jump(next_block, &[]);
+                        }
+                    }
+                }
+                
+                // Fail block returns 0
+                self.builder.switch_to_block(fail_block);
+                self.builder.seal_block(fail_block);
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                self.builder.ins().jump(merge_block, &[zero]);
+                
+                self.builder.switch_to_block(merge_block);
+                self.builder.seal_block(merge_block);
+                self.builder.block_params(merge_block)[0]
             }
             _ => self.builder.ins().iconst(types::I64, 0),
         }

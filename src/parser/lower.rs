@@ -36,6 +36,91 @@ impl<'a> Lowerer<'a> {
                 }
                 krate.items.insert(id, hir_item);
             }
+            
+            // Also lower methods from impl blocks
+            if let syn::Item::Impl(i) = item {
+                let type_name = self.type_name(&i.self_ty);
+                for impl_item in &i.items {
+                    if let syn::ImplItem::Fn(f) = impl_item {
+                        let method = self.lower_impl_fn(f, &type_name);
+                        krate.items.insert(method.id, method);
+                    }
+                }
+            }
+        }
+    }
+    
+    fn type_name(&self, ty: &syn::Type) -> String {
+        match ty {
+            syn::Type::Path(tp) => {
+                tp.path.segments.last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default()
+            }
+            _ => String::new(),
+        }
+    }
+    
+    fn lower_impl_fn(&self, f: &syn::ImplItemFn, type_name: &str) -> Item {
+        let id = self.alloc_def_id();
+        let method_name = f.sig.ident.to_string();
+        let full_name = format!("{}_{}", type_name, method_name);
+        
+        let mut inputs: Vec<(String, Type)> = Vec::new();
+        
+        for arg in &f.sig.inputs {
+            match arg {
+                syn::FnArg::Receiver(r) => {
+                    // self parameter - becomes pointer to struct
+                    inputs.push(("self".to_string(), Type {
+                        kind: TypeKind::Path(Path {
+                            segments: vec![PathSegment {
+                                ident: type_name.to_string(),
+                                args: None,
+                            }],
+                        }),
+                        span: Span::dummy(),
+                    }));
+                }
+                syn::FnArg::Typed(pat_ty) => {
+                    let name = if let syn::Pat::Ident(pi) = &*pat_ty.pat {
+                        pi.ident.to_string()
+                    } else {
+                        "_".to_string()
+                    };
+                    inputs.push((name, self.lower_type(&pat_ty.ty)));
+                }
+            }
+        }
+        
+        let output = match &f.sig.output {
+            syn::ReturnType::Default => Type {
+                kind: TypeKind::Unit,
+                span: Span::dummy(),
+            },
+            syn::ReturnType::Type(_, ty) => self.lower_type(ty),
+        };
+        
+        let sig = FnSig {
+            inputs,
+            output,
+            generics: self.lower_generics(&f.sig.generics),
+        };
+        
+        let body = Some(self.lower_block(&f.block));
+        
+        Item {
+            id,
+            name: full_name,
+            kind: ItemKind::Function(Function {
+                sig,
+                body,
+                is_async: f.sig.asyncness.is_some(),
+                is_const: f.sig.constness.is_some(),
+                is_unsafe: f.sig.unsafety.is_some(),
+            }),
+            visibility: self.lower_visibility(&f.vis),
+            span: self.span(f.span()),
         }
     }
 
@@ -642,6 +727,17 @@ impl<'a> Lowerer<'a> {
             syn::Expr::Await(a) => ExprKind::Await(Box::new(self.lower_expr(&a.base))),
             syn::Expr::Try(t) => ExprKind::Try(Box::new(self.lower_expr(&t.expr))),
             syn::Expr::Paren(p) => return self.lower_expr(&p.expr),
+            syn::Expr::Struct(s) => ExprKind::Struct {
+                path: self.lower_path(&s.path),
+                fields: s.fields.iter().map(|f| {
+                    let name = match &f.member {
+                        syn::Member::Named(ident) => ident.to_string(),
+                        syn::Member::Unnamed(idx) => idx.index.to_string(),
+                    };
+                    (name, self.lower_expr(&f.expr))
+                }).collect(),
+                rest: s.rest.as_ref().map(|r| Box::new(self.lower_expr(r))),
+            },
             syn::Expr::Macro(_) => ExprKind::Err,
             _ => ExprKind::Err,
         };

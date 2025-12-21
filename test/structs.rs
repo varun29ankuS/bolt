@@ -1,0 +1,9 @@
+struct Point {
+    x: i64,
+    y: i64,
+}
+
+fn main() -> i64 {
+    let p = Point { x: 10, y: 20 };
+    p.x + p.y
+}
