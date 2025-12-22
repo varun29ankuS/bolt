@@ -2,6 +2,18 @@
 //!
 //! Simplified borrow checking focusing on common patterns.
 //! Full NLL (Non-Lexical Lifetimes) is out of scope for MVP.
+//!
+//! ## Async Mode (BOL-14)
+//!
+//! The async_checker module provides background borrow checking:
+//! - Code runs immediately without waiting for borrow check
+//! - Borrow checker runs in parallel
+//! - Errors surface as warnings after execution
+//! - Next compilation blocks if previous check failed
+
+pub mod async_checker;
+
+pub use async_checker::{global_checker, AsyncBorrowChecker, CheckResult};
 
 use crate::error::{Diagnostic, DiagnosticEmitter, Span};
 use crate::hir::*;

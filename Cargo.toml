@@ -30,6 +30,7 @@ rayon = "1.10"  # Parallelism
 dashmap = "6.0"  # Concurrent hashmap
 parking_lot = "0.12"
 indexmap = "2.0"
+once_cell = "1.19"  # Lazy statics
 
 # Caching
 serde = { version = "1.0", features = ["derive"] }

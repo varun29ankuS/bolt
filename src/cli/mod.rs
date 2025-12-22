@@ -46,6 +46,10 @@ pub enum Commands {
         /// Output format for errors/diagnostics
         #[arg(long, short = 'f', value_enum, default_value_t = OutputFormat::Human)]
         format: OutputFormat,
+
+        /// Run borrow checker synchronously (default is async - code runs immediately)
+        #[arg(long)]
+        sync_borrow: bool,
     },
 
     /// Build a Rust file or project
@@ -97,8 +101,8 @@ pub fn run_cli() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { path, args, format } => {
-            run_file(&path, &args, format);
+        Commands::Run { path, args, format, sync_borrow } => {
+            run_file(&path, &args, format, !sync_borrow);
         }
         Commands::Build { path, output, release, format } => {
             build_file(&path, output.as_deref(), release, format);
@@ -224,8 +228,30 @@ fn emit_success(format: OutputFormat, message: &str, details: Option<serde_json:
     }
 }
 
-fn run_file(path: &PathBuf, _args: &[String], format: OutputFormat) {
+fn run_file(path: &PathBuf, _args: &[String], format: OutputFormat, async_mode: bool) {
     let start = Instant::now();
+
+    // Check if previous async borrow check failed - if so, block and show errors
+    if async_mode {
+        let checker = crate::borrowck::global_checker();
+        if let Some(diagnostics) = checker.check_previous_failure(path) {
+            if matches!(format, OutputFormat::Human) {
+                eprintln!(
+                    "{} Previous borrow check found issues:",
+                    "Blocked:".red().bold()
+                );
+            }
+            let json_diags: Vec<JsonDiagnostic> = diagnostics
+                .into_iter()
+                .map(|d| {
+                    JsonDiagnostic::error(ErrorCode::BorrowOfMovedValue, &d.message)
+                        .with_notes_from_vec(d.notes)
+                })
+                .collect();
+            emit_diagnostics(format, json_diags);
+            std::process::exit(1);
+        }
+    }
 
     if matches!(format, OutputFormat::Human) {
         println!("{} {}", "Compiling".green().bold(), path.display());
@@ -253,19 +279,29 @@ fn run_file(path: &PathBuf, _args: &[String], format: OutputFormat) {
         emit_error_and_exit(format, ErrorCode::TypeMismatch, "Type checking failed", Some(path), None, None);
     }
 
-    let borrow_checker = crate::borrowck::BorrowChecker::new();
-    borrow_checker.check_crate(&krate);
-    if borrow_checker.has_errors() {
-        let diagnostics: Vec<JsonDiagnostic> = borrow_checker
-            .take_diagnostics()
-            .into_iter()
-            .map(|d| {
-                JsonDiagnostic::error(ErrorCode::BorrowOfMovedValue, &d.message)
-                    .with_notes_from_vec(d.notes)
-            })
-            .collect();
-        emit_diagnostics(format, diagnostics);
-        std::process::exit(1);
+    // Borrow checking: async or sync based on flag
+    let krate_arc = Arc::new(krate);
+
+    if async_mode {
+        // Spawn borrow check in background - don't wait for it
+        let checker = crate::borrowck::global_checker();
+        checker.spawn_check(path.clone(), Arc::clone(&krate_arc));
+    } else {
+        // Synchronous borrow checking (traditional mode)
+        let borrow_checker = crate::borrowck::BorrowChecker::new();
+        borrow_checker.check_crate(&krate_arc);
+        if borrow_checker.has_errors() {
+            let diagnostics: Vec<JsonDiagnostic> = borrow_checker
+                .take_diagnostics()
+                .into_iter()
+                .map(|d| {
+                    JsonDiagnostic::error(ErrorCode::BorrowOfMovedValue, &d.message)
+                        .with_notes_from_vec(d.notes)
+                })
+                .collect();
+            emit_diagnostics(format, diagnostics);
+            std::process::exit(1);
+        }
     }
 
     let mut codegen = match crate::codegen::CodeGenerator::new(Arc::clone(&registry)) {
@@ -275,7 +311,7 @@ fn run_file(path: &PathBuf, _args: &[String], format: OutputFormat) {
         }
     };
 
-    if let Err(e) = codegen.compile_crate(&krate) {
+    if let Err(e) = codegen.compile_crate(&krate_arc) {
         emit_error_and_exit(format, ErrorCode::InternalError, &e.to_string(), Some(path), None, None);
     }
 
@@ -283,9 +319,10 @@ fn run_file(path: &PathBuf, _args: &[String], format: OutputFormat) {
 
     if matches!(format, OutputFormat::Human) {
         println!(
-            "{} in {:.2}ms",
+            "{} in {:.2}ms{}",
             "Compiled".green().bold(),
-            compile_time.as_secs_f64() * 1000.0
+            compile_time.as_secs_f64() * 1000.0,
+            if async_mode { " (borrow check async)" } else { "" }
         );
         println!("{}", "Running...".cyan());
         println!();
@@ -300,10 +337,45 @@ fn run_file(path: &PathBuf, _args: &[String], format: OutputFormat) {
                     "Finished".green().bold(),
                     exit_code
                 );
-            } else {
+            }
+
+            // After execution, check if async borrow check completed and show results
+            if async_mode {
+                let checker = crate::borrowck::global_checker();
+                match checker.wait_for_result(path) {
+                    crate::borrowck::CheckResult::Failed(diagnostics) => {
+                        if matches!(format, OutputFormat::Human) {
+                            eprintln!();
+                            eprintln!(
+                                "{} Borrow checker found issues (code ran anyway):",
+                                "Warning:".yellow().bold()
+                            );
+                        }
+                        let json_diags: Vec<JsonDiagnostic> = diagnostics
+                            .into_iter()
+                            .map(|d| {
+                                JsonDiagnostic::warning(ErrorCode::BorrowOfMovedValue, &d.message)
+                                    .with_notes_from_vec(d.notes)
+                            })
+                            .collect();
+                        emit_diagnostics(format, json_diags);
+                        // Note: Don't exit with error - code already ran
+                        // Next compilation will block if this file is run again
+                    }
+                    crate::borrowck::CheckResult::Success => {
+                        // All good
+                    }
+                    crate::borrowck::CheckResult::Pending => {
+                        // Shouldn't happen after wait_for_result
+                    }
+                }
+            }
+
+            if !async_mode || matches!(format, OutputFormat::Json | OutputFormat::JsonPretty) {
                 emit_success(format, "Execution completed", Some(serde_json::json!({
                     "exit_code": exit_code,
-                    "compile_time_ms": compile_time.as_secs_f64() * 1000.0
+                    "compile_time_ms": compile_time.as_secs_f64() * 1000.0,
+                    "async_mode": async_mode
                 })));
             }
         }
