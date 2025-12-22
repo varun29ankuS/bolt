@@ -8,6 +8,7 @@
 //! ```
 
 pub mod parser;
+pub mod ty;
 pub mod typeck;
 pub mod borrowck;
 pub mod codegen;
@@ -17,3 +18,4 @@ pub mod error;
 pub mod hir;
 
 pub use error::{BoltError, Result};
+pub use ty::TypeRegistry;

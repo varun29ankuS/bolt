@@ -16,6 +16,26 @@ impl<'a> Lowerer<'a> {
         Self { parser, file_id }
     }
 
+    /// Extract derive traits from #[derive(...)] attributes
+    fn extract_derives(&self, attrs: &[syn::Attribute]) -> Vec<String> {
+        let mut derives = Vec::new();
+        for attr in attrs {
+            if attr.path().is_ident("derive") {
+                if let syn::Meta::List(list) = &attr.meta {
+                    // Parse the derive list tokens
+                    let tokens = list.tokens.to_string();
+                    for part in tokens.split(',') {
+                        let trait_name = part.trim();
+                        if !trait_name.is_empty() {
+                            derives.push(trait_name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        derives
+    }
+
     fn span(&self, _s: proc_macro2::Span) -> Span {
         // Use dummy span - proc_macro2 span position requires special features
         Span::new(self.file_id, 0, 0)
@@ -26,26 +46,150 @@ impl<'a> Lowerer<'a> {
     }
 
     pub fn lower_file(&self, file: &syn::File, krate: &mut Crate) {
-        for item in &file.items {
-            if let Some(hir_item) = self.lower_item(item) {
+        self.lower_items(&file.items, krate, "");
+    }
+
+    fn lower_items(&self, items: &[syn::Item], krate: &mut Crate, prefix: &str) {
+        for item in items {
+            // Process use statements to build import aliases
+            if let syn::Item::Use(u) = item {
+                self.process_use(&u.tree, "", krate, prefix);
+                continue;
+            }
+
+            if let Some(mut hir_item) = self.lower_item(item) {
+                // Prefix item names in modules (except main at top level)
+                if !prefix.is_empty() && !matches!(&hir_item.kind, ItemKind::Module(_)) {
+                    // For functions and structs inside modules, mangle the name
+                    // This allows them to be found via module::item paths
+                    hir_item.name = format!("{}::{}", prefix, hir_item.name);
+                }
+
                 let id = hir_item.id;
                 if let ItemKind::Function(ref f) = hir_item.kind {
-                    if hir_item.name == "main" && f.sig.inputs.is_empty() {
+                    // Only look for main at the top level with original name
+                    if prefix.is_empty() && hir_item.name == "main" && f.sig.inputs.is_empty() {
                         krate.entry_point = Some(id);
                     }
                 }
                 krate.items.insert(id, hir_item);
             }
-            
+
             // Also lower methods from impl blocks
             if let syn::Item::Impl(i) = item {
                 let type_name = self.type_name(&i.self_ty);
+                let full_type = if prefix.is_empty() {
+                    type_name.clone()
+                } else {
+                    format!("{}::{}", prefix, type_name)
+                };
                 for impl_item in &i.items {
                     if let syn::ImplItem::Fn(f) = impl_item {
-                        let method = self.lower_impl_fn(f, &type_name);
+                        let method = self.lower_impl_fn(f, &full_type);
                         krate.items.insert(method.id, method);
                     }
                 }
+            }
+
+            // Recursively lower inline modules
+            if let syn::Item::Mod(m) = item {
+                if let Some((_, content_items)) = &m.content {
+                    let mod_prefix = if prefix.is_empty() {
+                        m.ident.to_string()
+                    } else {
+                        format!("{}::{}", prefix, m.ident)
+                    };
+                    self.lower_items(content_items, krate, &mod_prefix);
+                }
+            }
+
+            // Process derive macros for structs
+            if let syn::Item::Struct(s) = item {
+                let derives = self.extract_derives(&s.attrs);
+                let type_name = s.ident.to_string();
+                let full_type = if prefix.is_empty() {
+                    type_name.clone()
+                } else {
+                    format!("{}::{}", prefix, type_name)
+                };
+
+                for derive in derives {
+                    if let Some(method) = self.generate_derive_method(&derive, &full_type, s) {
+                        krate.items.insert(method.id, method);
+                    }
+                }
+            }
+
+            // Process derive macros for enums
+            if let syn::Item::Enum(e) = item {
+                let derives = self.extract_derives(&e.attrs);
+                let type_name = e.ident.to_string();
+                let full_type = if prefix.is_empty() {
+                    type_name.clone()
+                } else {
+                    format!("{}::{}", prefix, type_name)
+                };
+
+                for derive in derives {
+                    if let Some(method) = self.generate_derive_method_enum(&derive, &full_type, e) {
+                        krate.items.insert(method.id, method);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Process a use tree to extract import aliases
+    fn process_use(&self, tree: &syn::UseTree, path_prefix: &str, krate: &mut Crate, module_prefix: &str) {
+        match tree {
+            syn::UseTree::Path(p) => {
+                // use foo::bar::... - accumulate path
+                let new_prefix = if path_prefix.is_empty() {
+                    p.ident.to_string()
+                } else {
+                    format!("{}::{}", path_prefix, p.ident)
+                };
+                self.process_use(&p.tree, &new_prefix, krate, module_prefix);
+            }
+            syn::UseTree::Name(n) => {
+                // use foo::bar; - final name
+                let full_path = if path_prefix.is_empty() {
+                    n.ident.to_string()
+                } else {
+                    format!("{}::{}", path_prefix, n.ident)
+                };
+                let alias = n.ident.to_string();
+                // If we're in a module, the import is local to that module
+                let key = if module_prefix.is_empty() {
+                    alias
+                } else {
+                    format!("{}::{}", module_prefix, alias)
+                };
+                krate.imports.insert(key, full_path);
+            }
+            syn::UseTree::Rename(r) => {
+                // use foo::bar as baz;
+                let full_path = if path_prefix.is_empty() {
+                    r.ident.to_string()
+                } else {
+                    format!("{}::{}", path_prefix, r.ident)
+                };
+                let alias = r.rename.to_string();
+                let key = if module_prefix.is_empty() {
+                    alias
+                } else {
+                    format!("{}::{}", module_prefix, alias)
+                };
+                krate.imports.insert(key, full_path);
+            }
+            syn::UseTree::Group(g) => {
+                // use foo::{bar, baz};
+                for tree in &g.items {
+                    self.process_use(tree, path_prefix, krate, module_prefix);
+                }
+            }
+            syn::UseTree::Glob(_) => {
+                // use foo::*; - not supported yet, would need to enumerate all items
             }
         }
     }
@@ -122,6 +266,183 @@ impl<'a> Lowerer<'a> {
             visibility: self.lower_visibility(&f.vis),
             span: self.span(f.span()),
         }
+    }
+
+    /// Generate a method for a derive macro on a struct
+    fn generate_derive_method(&self, derive: &str, type_name: &str, s: &syn::ItemStruct) -> Option<Item> {
+        match derive {
+            "Clone" => self.generate_clone_method(type_name, s),
+            "Copy" => None,  // Copy is a marker trait, no method needed
+            "Debug" => self.generate_debug_method(type_name, s),
+            "Default" => self.generate_default_method(type_name, s),
+            _ => None,
+        }
+    }
+
+    /// Generate a method for a derive macro on an enum
+    fn generate_derive_method_enum(&self, derive: &str, type_name: &str, _e: &syn::ItemEnum) -> Option<Item> {
+        match derive {
+            "Clone" | "Copy" | "Debug" => None,  // Enums handled by existing enum machinery
+            _ => None,
+        }
+    }
+
+    /// Generate Clone::clone method for a struct
+    fn generate_clone_method(&self, type_name: &str, s: &syn::ItemStruct) -> Option<Item> {
+        let id = self.alloc_def_id();
+        let full_name = format!("{}_clone", type_name);
+
+        // Clone takes &self and returns Self
+        let self_ty = Type {
+            kind: TypeKind::Path(Path {
+                segments: vec![PathSegment { ident: type_name.to_string(), args: None }],
+            }),
+            span: Span::new(self.file_id, 0, 0),
+        };
+
+        let sig = FnSig {
+            inputs: vec![("self".to_string(), self_ty.clone())],
+            output: self_ty.clone(),
+            generics: Generics::default(),
+        };
+
+        // Body: return self (since we treat everything as Copy for now)
+        let body = Block {
+            stmts: Vec::new(),
+            expr: Some(Box::new(Expr {
+                kind: ExprKind::Path(Path {
+                    segments: vec![PathSegment { ident: "self".to_string(), args: None }],
+                }),
+                ty: None,
+                span: Span::new(self.file_id, 0, 0),
+            })),
+            span: Span::new(self.file_id, 0, 0),
+        };
+
+        Some(Item {
+            id,
+            name: full_name,
+            kind: ItemKind::Function(Function {
+                sig,
+                body: Some(body),
+                is_async: false,
+                is_const: false,
+                is_unsafe: false,
+            }),
+            visibility: Visibility::Public,
+            span: Span::new(self.file_id, 0, 0),
+        })
+    }
+
+    /// Generate Debug method (prints type name and fields)
+    fn generate_debug_method(&self, type_name: &str, _s: &syn::ItemStruct) -> Option<Item> {
+        // For now, Debug just prints the type name
+        // A full implementation would iterate fields
+        let id = self.alloc_def_id();
+        let full_name = format!("{}_debug", type_name);
+
+        let self_ty = Type {
+            kind: TypeKind::Path(Path {
+                segments: vec![PathSegment { ident: type_name.to_string(), args: None }],
+            }),
+            span: Span::new(self.file_id, 0, 0),
+        };
+
+        let sig = FnSig {
+            inputs: vec![("self".to_string(), self_ty)],
+            output: Type { kind: TypeKind::Unit, span: Span::new(self.file_id, 0, 0) },
+            generics: Generics::default(),
+        };
+
+        // Body: call bolt_print_str with type name
+        let body = Block {
+            stmts: Vec::new(),
+            expr: Some(Box::new(Expr {
+                kind: ExprKind::Lit(Literal::Int(0, None)),  // Placeholder
+                ty: None,
+                span: Span::new(self.file_id, 0, 0),
+            })),
+            span: Span::new(self.file_id, 0, 0),
+        };
+
+        Some(Item {
+            id,
+            name: full_name,
+            kind: ItemKind::Function(Function {
+                sig,
+                body: Some(body),
+                is_async: false,
+                is_const: false,
+                is_unsafe: false,
+            }),
+            visibility: Visibility::Public,
+            span: Span::new(self.file_id, 0, 0),
+        })
+    }
+
+    /// Generate Default::default method
+    fn generate_default_method(&self, type_name: &str, s: &syn::ItemStruct) -> Option<Item> {
+        let id = self.alloc_def_id();
+        let full_name = format!("{}_default", type_name);
+
+        let self_ty = Type {
+            kind: TypeKind::Path(Path {
+                segments: vec![PathSegment { ident: type_name.to_string(), args: None }],
+            }),
+            span: Span::new(self.file_id, 0, 0),
+        };
+
+        let sig = FnSig {
+            inputs: Vec::new(),  // Default takes no args
+            output: self_ty,
+            generics: Generics::default(),
+        };
+
+        // Body: construct struct with default values (0 for all fields)
+        let fields: Vec<(String, Expr)> = match &s.fields {
+            syn::Fields::Named(named) => {
+                named.named.iter().map(|f| {
+                    let name = f.ident.as_ref().map(|i| i.to_string()).unwrap_or_default();
+                    let expr = Expr {
+                        kind: ExprKind::Lit(Literal::Int(0, None)),
+                        ty: None,
+                        span: Span::new(self.file_id, 0, 0),
+                    };
+                    (name, expr)
+                }).collect()
+            }
+            _ => Vec::new(),
+        };
+
+        let body = Block {
+            stmts: Vec::new(),
+            expr: Some(Box::new(Expr {
+                kind: ExprKind::Struct {
+                    path: Path {
+                        segments: vec![PathSegment { ident: type_name.to_string(), args: None }],
+                    },
+                    fields,
+                    rest: None,
+                },
+                ty: None,
+                span: Span::new(self.file_id, 0, 0),
+            })),
+            span: Span::new(self.file_id, 0, 0),
+        };
+
+        Some(Item {
+            id,
+            name: full_name,
+            kind: ItemKind::Function(Function {
+                sig,
+                body: Some(body),
+                is_async: false,
+                is_const: false,
+                is_unsafe: false,
+            }),
+            visibility: Visibility::Public,
+            span: Span::new(self.file_id, 0, 0),
+        })
     }
 
     fn lower_item(&self, item: &syn::Item) -> Option<Item> {
@@ -523,10 +844,16 @@ impl<'a> Lowerer<'a> {
 
             match stmt {
                 syn::Stmt::Local(local) => {
+                    // Handle type annotation in pattern (let a: f64 = 3.5 creates Pat::Type)
+                    let (pattern, ty) = if let syn::Pat::Type(pt) = &local.pat {
+                        (self.lower_pattern(&pt.pat), Some(self.lower_type(&pt.ty)))
+                    } else {
+                        (self.lower_pattern(&local.pat), None)
+                    };
                     stmts.push(Stmt {
                         kind: StmtKind::Let {
-                            pattern: self.lower_pattern(&local.pat),
-                            ty: None, // syn 2.0 type is inferred from init
+                            pattern,
+                            ty,
                             init: local.init.as_ref().map(|init| self.lower_expr(&init.expr)),
                         },
                         span: self.span(local.span()),
@@ -665,11 +992,23 @@ impl<'a> Lowerer<'a> {
             syn::Expr::Array(a) => {
                 ExprKind::Array(a.elems.iter().map(|e| self.lower_expr(e)).collect())
             }
-            syn::Expr::If(i) => ExprKind::If {
-                cond: Box::new(self.lower_expr(&i.cond)),
-                then_branch: Box::new(self.lower_block(&i.then_branch)),
-                else_branch: i.else_branch.as_ref().map(|(_, e)| Box::new(self.lower_expr(e))),
-            },
+            syn::Expr::If(i) => {
+                // Check if this is an if-let
+                if let syn::Expr::Let(let_expr) = &*i.cond {
+                    ExprKind::IfLet {
+                        pattern: self.lower_pattern(&let_expr.pat),
+                        expr: Box::new(self.lower_expr(&let_expr.expr)),
+                        then_branch: Box::new(self.lower_block(&i.then_branch)),
+                        else_branch: i.else_branch.as_ref().map(|(_, e)| Box::new(self.lower_expr(e))),
+                    }
+                } else {
+                    ExprKind::If {
+                        cond: Box::new(self.lower_expr(&i.cond)),
+                        then_branch: Box::new(self.lower_block(&i.then_branch)),
+                        else_branch: i.else_branch.as_ref().map(|(_, e)| Box::new(self.lower_expr(e))),
+                    }
+                }
+            }
             syn::Expr::Match(m) => ExprKind::Match {
                 expr: Box::new(self.lower_expr(&m.expr)),
                 arms: m
@@ -686,11 +1025,23 @@ impl<'a> Lowerer<'a> {
                 body: Box::new(self.lower_block(&l.body)),
                 label: l.label.as_ref().map(|l| l.name.ident.to_string()),
             },
-            syn::Expr::While(w) => ExprKind::While {
-                cond: Box::new(self.lower_expr(&w.cond)),
-                body: Box::new(self.lower_block(&w.body)),
-                label: w.label.as_ref().map(|l| l.name.ident.to_string()),
-            },
+            syn::Expr::While(w) => {
+                // Check if this is a while-let
+                if let syn::Expr::Let(let_expr) = &*w.cond {
+                    ExprKind::WhileLet {
+                        pattern: self.lower_pattern(&let_expr.pat),
+                        expr: Box::new(self.lower_expr(&let_expr.expr)),
+                        body: Box::new(self.lower_block(&w.body)),
+                        label: w.label.as_ref().map(|l| l.name.ident.to_string()),
+                    }
+                } else {
+                    ExprKind::While {
+                        cond: Box::new(self.lower_expr(&w.cond)),
+                        body: Box::new(self.lower_block(&w.body)),
+                        label: w.label.as_ref().map(|l| l.name.ident.to_string()),
+                    }
+                }
+            }
             syn::Expr::ForLoop(f) => ExprKind::For {
                 pattern: self.lower_pattern(&f.pat),
                 iter: Box::new(self.lower_expr(&f.expr)),
@@ -737,6 +1088,11 @@ impl<'a> Lowerer<'a> {
                     (name, self.lower_expr(&f.expr))
                 }).collect(),
                 rest: s.rest.as_ref().map(|r| Box::new(self.lower_expr(r))),
+            },
+            syn::Expr::Range(r) => ExprKind::Range {
+                lo: r.start.as_ref().map(|e| Box::new(self.lower_expr(e))),
+                hi: r.end.as_ref().map(|e| Box::new(self.lower_expr(e))),
+                inclusive: matches!(r.limits, syn::RangeLimits::Closed(_)),
             },
             syn::Expr::Macro(_) => ExprKind::Err,
             _ => ExprKind::Err,

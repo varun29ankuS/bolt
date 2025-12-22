@@ -15,6 +15,8 @@ pub struct Crate {
     pub name: String,
     pub items: IndexMap<DefId, Item>,
     pub entry_point: Option<DefId>,
+    /// Import aliases: short_name -> full_path (e.g., "add" -> "math::add")
+    pub imports: std::collections::HashMap<String, String>,
 }
 
 impl Crate {
@@ -23,6 +25,7 @@ impl Crate {
             name,
             items: IndexMap::new(),
             entry_point: None,
+            imports: std::collections::HashMap::new(),
         }
     }
 }
@@ -57,7 +60,7 @@ pub enum Visibility {
     Super,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Function {
     pub sig: FnSig,
     pub body: Option<Block>,
@@ -66,33 +69,33 @@ pub struct Function {
     pub is_unsafe: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FnSig {
     pub inputs: Vec<(String, Type)>,
     pub output: Type,
     pub generics: Generics,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Generics {
     pub params: Vec<GenericParam>,
     pub where_clause: Vec<WherePredicate>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum GenericParam {
     Type { name: String, bounds: Vec<TypeBound> },
     Lifetime { name: String },
     Const { name: String, ty: Type },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WherePredicate {
     pub ty: Type,
     pub bounds: Vec<TypeBound>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TypeBound {
     Trait(Path),
     Lifetime(String),
@@ -125,17 +128,17 @@ pub enum TypeKind {
     Error,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntType {
     I8, I16, I32, I64, I128, Isize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UintType {
     U8, U16, U32, U64, U128, Usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FloatType {
     F32, F64,
 }
@@ -306,9 +309,11 @@ pub enum ExprKind {
     Repeat { elem: Box<Expr>, count: Box<Expr> },
     Struct { path: Path, fields: Vec<(String, Expr)>, rest: Option<Box<Expr>> },
     If { cond: Box<Expr>, then_branch: Box<Block>, else_branch: Option<Box<Expr>> },
+    IfLet { pattern: Pattern, expr: Box<Expr>, then_branch: Box<Block>, else_branch: Option<Box<Expr>> },
     Match { expr: Box<Expr>, arms: Vec<Arm> },
     Loop { body: Box<Block>, label: Option<String> },
     While { cond: Box<Expr>, body: Box<Block>, label: Option<String> },
+    WhileLet { pattern: Pattern, expr: Box<Expr>, body: Box<Block>, label: Option<String> },
     For { pattern: Pattern, iter: Box<Expr>, body: Box<Block>, label: Option<String> },
     Block(Box<Block>),
     Return(Option<Box<Expr>>),
