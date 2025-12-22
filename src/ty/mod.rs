@@ -7,15 +7,15 @@
 //! - Monomorphization (specializing generic types/functions)
 //! - Type layout calculation for codegen
 
+use crate::error::Span;
 use crate::hir::{
     self, Crate, DefId, Enum, FloatType, GenericParam, Generics, IntType, ItemKind, Path,
-    PathSegment, Struct, StructKind, Type as HirType, TypeAlias, TypeKind, UintType,
+    PathSegment, Struct, StructKind, Type as HirType, TypeKind, UintType,
 };
 use indexmap::IndexMap;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
 
 /// A unique identifier for a resolved type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -162,6 +162,10 @@ pub struct TypeRegistry {
     layouts: RwLock<HashMap<TyId, TypeLayout>>,
     /// Monomorphized function instances
     mono_instances: RwLock<HashMap<MonoKey, String>>,
+    /// Expression types by span - populated during type checking
+    expr_types: RwLock<HashMap<Span, TyId>>,
+    /// Local variable types by (function_name, var_name)
+    local_types: RwLock<HashMap<(String, String), TyId>>,
 }
 
 impl TypeRegistry {
@@ -176,6 +180,8 @@ impl TypeRegistry {
             type_aliases: RwLock::new(HashMap::new()),
             layouts: RwLock::new(HashMap::new()),
             mono_instances: RwLock::new(HashMap::new()),
+            expr_types: RwLock::new(HashMap::new()),
+            local_types: RwLock::new(HashMap::new()),
         }
     }
 
@@ -878,6 +884,30 @@ impl TypeRegistry {
     /// Get the alignment of a type in bytes
     pub fn align_of(&self, ty_id: TyId) -> usize {
         self.layout(ty_id).align
+    }
+
+    // ========================================================================
+    // Expression and Local Type Recording (populated by typeck)
+    // ========================================================================
+
+    /// Record the type of an expression by its span
+    pub fn record_expr_type(&self, span: Span, ty: TyId) {
+        self.expr_types.write().insert(span, ty);
+    }
+
+    /// Get the type of an expression by its span
+    pub fn get_expr_type(&self, span: Span) -> Option<TyId> {
+        self.expr_types.read().get(&span).copied()
+    }
+
+    /// Record a local variable's type
+    pub fn record_local_type(&self, func: &str, name: &str, ty: TyId) {
+        self.local_types.write().insert((func.to_string(), name.to_string()), ty);
+    }
+
+    /// Get a local variable's type
+    pub fn get_local_type(&self, func: &str, name: &str) -> Option<TyId> {
+        self.local_types.read().get(&(func.to_string(), name.to_string())).copied()
     }
 }
 

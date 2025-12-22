@@ -28,6 +28,26 @@ impl TypeContext {
         }
     }
 
+    /// Record the type of an expression (delegates to registry)
+    pub fn record_expr_type(&self, span: Span, ty: TyId) {
+        self.registry.record_expr_type(span, ty);
+    }
+
+    /// Get the type of an expression by its span (delegates to registry)
+    pub fn get_expr_type(&self, span: Span) -> Option<TyId> {
+        self.registry.get_expr_type(span)
+    }
+
+    /// Record a local variable's type (delegates to registry)
+    pub fn record_local_type(&self, func: &str, name: &str, ty: TyId) {
+        self.registry.record_local_type(func, name, ty);
+    }
+
+    /// Get a local variable's type (delegates to registry)
+    pub fn get_local_type(&self, func: &str, name: &str) -> Option<TyId> {
+        self.registry.get_local_type(func, name)
+    }
+
     pub fn emit_error(&self, diag: Diagnostic) {
         self.diagnostics.write().emit(diag);
     }
@@ -227,6 +247,8 @@ pub struct TypeChecker<'a> {
     type_params: HashMap<String, TyId>,
     /// Expected return type of current function
     return_type: Option<TyId>,
+    /// Current function name (for recording local types)
+    current_function: String,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -237,6 +259,7 @@ impl<'a> TypeChecker<'a> {
             locals: IndexMap::new(),
             type_params: HashMap::new(),
             return_type: None,
+            current_function: String::new(),
         }
     }
 
@@ -264,6 +287,7 @@ impl<'a> TypeChecker<'a> {
     fn check_function(&mut self, f: &Function, name: &str) -> Result<()> {
         self.locals.clear();
         self.type_params.clear();
+        self.current_function = name.to_string();
 
         // Register type parameters
         for (i, param) in f.sig.generics.params.iter().enumerate() {
@@ -276,10 +300,11 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
-        // Register parameters
+        // Register parameters and record their types
         for (param_name, param_ty) in &f.sig.inputs {
             let ty_id = self.resolve_type(param_ty);
             self.locals.insert(param_name.clone(), ty_id);
+            self.ctx.record_local_type(name, param_name, ty_id);
         }
 
         let expected_return = self.resolve_type(&f.sig.output);
@@ -362,6 +387,7 @@ impl<'a> TypeChecker<'a> {
         match &pattern.kind {
             PatternKind::Ident { name, .. } => {
                 self.locals.insert(name.clone(), ty);
+                self.ctx.record_local_type(&self.current_function, name, ty);
             }
             PatternKind::Tuple(pats) => {
                 if let Some(Ty::Tuple(elem_tys)) = self.ctx.registry.get(ty) {
@@ -431,6 +457,13 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn check_expr(&mut self, expr: &Expr) -> Result<TyId> {
+        let ty = self.check_expr_inner(expr)?;
+        // Record the expression type for codegen to use
+        self.ctx.record_expr_type(expr.span, ty);
+        Ok(ty)
+    }
+
+    fn check_expr_inner(&mut self, expr: &Expr) -> Result<TyId> {
         match &expr.kind {
             ExprKind::Lit(lit) => Ok(self.literal_type(lit)),
             ExprKind::Path(path) => self.resolve_path(path, expr.span),

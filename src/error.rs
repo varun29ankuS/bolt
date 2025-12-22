@@ -41,7 +41,7 @@ pub enum BoltError {
     Internal(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Span {
     pub file_id: u32,
     pub start: u32,

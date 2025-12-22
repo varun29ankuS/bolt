@@ -1,1 +1,5 @@
 /target
+
+# Test build artifacts
+test/*.exe
+test/*.pdb
