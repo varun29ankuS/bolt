@@ -2,15 +2,82 @@
 //!
 //! Runs borrow checking in the background while code executes immediately.
 //! Implements the "compile first, verify later" philosophy.
+//!
+//! State is persisted to disk so blocking works across CLI invocations.
 
 use super::BorrowChecker;
 use crate::error::Diagnostic;
 use crate::hir::Crate;
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+
+/// Canonicalize a path for consistent HashMap keys
+fn canonical_path(path: &PathBuf) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.clone())
+}
+
+/// Get the failure state file path for a source file
+fn failure_marker_path(source_path: &PathBuf) -> PathBuf {
+    let cache_dir = dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("bolt")
+        .join("borrow_check");
+
+    // Create hash of source path for the marker file name
+    let path_str = source_path.to_string_lossy();
+    let hash = blake3::hash(path_str.as_bytes());
+    let hash_str = &hash.to_hex()[..16]; // Use first 16 hex chars
+
+    cache_dir.join(format!("{}.failed", hash_str))
+}
+
+/// Persisted failure state
+#[derive(Serialize, Deserialize)]
+struct PersistedFailure {
+    source_path: String,
+    messages: Vec<String>,
+}
+
+/// Save failure state to disk
+fn persist_failure(path: &PathBuf, diagnostics: &[Diagnostic]) {
+    let marker_path = failure_marker_path(path);
+
+    // Ensure directory exists
+    if let Some(parent) = marker_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let failure = PersistedFailure {
+        source_path: path.to_string_lossy().to_string(),
+        messages: diagnostics.iter().map(|d| d.message.clone()).collect(),
+    };
+
+    if let Ok(json) = serde_json::to_string(&failure) {
+        let _ = std::fs::write(&marker_path, json);
+    }
+}
+
+/// Load failure state from disk
+fn load_persisted_failure(path: &PathBuf) -> Option<Vec<String>> {
+    let marker_path = failure_marker_path(path);
+
+    if let Ok(content) = std::fs::read_to_string(&marker_path) {
+        if let Ok(failure) = serde_json::from_str::<PersistedFailure>(&content) {
+            return Some(failure.messages);
+        }
+    }
+    None
+}
+
+/// Clear failure state from disk
+fn clear_persisted_failure(path: &PathBuf) {
+    let marker_path = failure_marker_path(path);
+    let _ = std::fs::remove_file(&marker_path);
+}
 
 /// Result of a borrow check
 #[derive(Debug, Clone)]
@@ -32,7 +99,7 @@ struct FileCheckState {
 
 /// Async borrow checker that runs checks in the background
 pub struct AsyncBorrowChecker {
-    /// Per-file check state
+    /// Per-file check state (keyed by canonical path)
     file_states: RwLock<HashMap<PathBuf, FileCheckState>>,
 }
 
@@ -44,59 +111,77 @@ impl AsyncBorrowChecker {
     }
 
     /// Check if a previous borrow check failed for this file.
-    /// If so, block and return the errors.
+    /// Checks both in-memory state and persisted disk state.
     /// Call this BEFORE starting compilation.
     pub fn check_previous_failure(&self, path: &PathBuf) -> Option<Vec<Diagnostic>> {
-        let mut states = self.file_states.write();
+        let canonical = canonical_path(path);
 
-        if let Some(state) = states.get_mut(path) {
-            // If there's a pending check, wait for it
-            if let Some(handle) = state.handle.take() {
-                match handle.join() {
-                    Ok(diagnostics) => {
-                        if diagnostics.is_empty() {
+        // First check in-memory state
+        {
+            let mut states = self.file_states.write();
+            if let Some(state) = states.get_mut(&canonical) {
+                // If there's a pending check, wait for it
+                if let Some(handle) = state.handle.take() {
+                    match handle.join() {
+                        Ok(diagnostics) => {
+                            if diagnostics.is_empty() {
+                                state.result = CheckResult::Success;
+                            } else {
+                                state.result = CheckResult::Failed(diagnostics);
+                            }
+                        }
+                        Err(_) => {
                             state.result = CheckResult::Success;
-                        } else {
-                            state.result = CheckResult::Failed(diagnostics);
                         }
                     }
-                    Err(_) => {
-                        // Thread panicked, treat as success (don't block)
-                        state.result = CheckResult::Success;
-                    }
                 }
-            }
 
-            // Check if previous result was a failure
-            match &state.result {
-                CheckResult::Failed(diagnostics) => {
-                    let diags = diagnostics.clone();
-                    // Clear the failure so we can try again
-                    state.result = CheckResult::Pending;
-                    Some(diags)
+                if let CheckResult::Failed(diagnostics) = &state.result {
+                    return Some(diagnostics.clone());
                 }
-                _ => None,
             }
-        } else {
-            None
         }
+
+        // Check disk-persisted state (from previous CLI invocation)
+        if let Some(messages) = load_persisted_failure(&canonical) {
+            let diagnostics: Vec<Diagnostic> = messages
+                .into_iter()
+                .map(|msg| Diagnostic::error(msg))
+                .collect();
+            return Some(diagnostics);
+        }
+
+        None
     }
 
     /// Spawn borrow checking in the background.
     /// Returns immediately - check result will be available later.
+    /// Clears any persisted failure state since we're recompiling.
     pub fn spawn_check(&self, path: PathBuf, krate: Arc<Crate>) {
-        // Clone what we need for the thread
-        let path_clone = path.clone();
+        let canonical = canonical_path(&path);
+
+        // Clear persisted failure since we're recompiling
+        clear_persisted_failure(&canonical);
+
+        // Clone canonical path for the thread closure
+        let canonical_for_persist = canonical.clone();
 
         let handle = thread::spawn(move || {
             let checker = BorrowChecker::new();
             checker.check_crate(&krate);
-            checker.take_diagnostics()
+            let diagnostics = checker.take_diagnostics();
+
+            // Persist failure to disk if there are errors
+            if !diagnostics.is_empty() {
+                persist_failure(&canonical_for_persist, &diagnostics);
+            }
+
+            diagnostics
         });
 
         let mut states = self.file_states.write();
         states.insert(
-            path,
+            canonical,
             FileCheckState {
                 result: CheckResult::Pending,
                 handle: Some(handle),
@@ -107,10 +192,10 @@ impl AsyncBorrowChecker {
     /// Wait for the current check to complete and get results.
     /// Call this AFTER execution to show any warnings.
     pub fn wait_for_result(&self, path: &PathBuf) -> CheckResult {
+        let canonical = canonical_path(path);
         let mut states = self.file_states.write();
 
-        if let Some(state) = states.get_mut(path) {
-            // If there's a pending check, wait for it
+        if let Some(state) = states.get_mut(&canonical) {
             if let Some(handle) = state.handle.take() {
                 match handle.join() {
                     Ok(diagnostics) => {
@@ -134,10 +219,10 @@ impl AsyncBorrowChecker {
     /// Try to get result without blocking.
     /// Returns None if check is still pending.
     pub fn try_get_result(&self, path: &PathBuf) -> Option<CheckResult> {
+        let canonical = canonical_path(path);
         let mut states = self.file_states.write();
 
-        if let Some(state) = states.get_mut(path) {
-            // Check if thread is done without blocking
+        if let Some(state) = states.get_mut(&canonical) {
             if let Some(handle) = state.handle.take() {
                 if handle.is_finished() {
                     match handle.join() {
@@ -154,7 +239,6 @@ impl AsyncBorrowChecker {
                     }
                     Some(state.result.clone())
                 } else {
-                    // Still running, put handle back
                     state.handle = Some(handle);
                     None
                 }
@@ -168,7 +252,9 @@ impl AsyncBorrowChecker {
 
     /// Clear state for a file (e.g., when source changes)
     pub fn clear(&self, path: &PathBuf) {
-        self.file_states.write().remove(path);
+        let canonical = canonical_path(path);
+        self.file_states.write().remove(&canonical);
+        clear_persisted_failure(&canonical);
     }
 }
 
