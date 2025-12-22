@@ -21,6 +21,40 @@ use std::sync::atomic::{AtomicU32, Ordering};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TyId(pub u32);
 
+/// A unique identifier for a lifetime
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LifetimeId(pub u32);
+
+/// Represents a lifetime in the type system
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Lifetime {
+    /// The static lifetime 'static
+    Static,
+    /// A named lifetime parameter (e.g., 'a)
+    Named(String),
+    /// An inferred lifetime (assigned during type checking)
+    Infer(u32),
+    /// An anonymous/elided lifetime
+    Anonymous,
+    /// Lifetime bound to a specific scope
+    Bound {
+        /// Scope depth (higher = inner scope)
+        scope_depth: u32,
+        /// Index within the scope
+        index: u32,
+    },
+}
+
+impl Lifetime {
+    pub fn is_static(&self) -> bool {
+        matches!(self, Lifetime::Static)
+    }
+
+    pub fn is_infer(&self) -> bool {
+        matches!(self, Lifetime::Infer(_))
+    }
+}
+
 /// The resolved, canonical form of a type
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Ty {
@@ -40,7 +74,7 @@ pub enum Ty {
     Str,
     /// Reference `&T` or `&mut T`
     Ref {
-        lifetime: Option<String>,
+        lifetime: LifetimeId,
         mutable: bool,
         inner: TyId,
     },
@@ -142,6 +176,17 @@ pub struct MonoKey {
     pub type_args: Vec<TyId>,
 }
 
+/// A lifetime constraint: lhs outlives rhs ('lhs: 'rhs)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LifetimeConstraint {
+    /// The lifetime that must live longer
+    pub lhs: LifetimeId,
+    /// The lifetime that must be outlived
+    pub rhs: LifetimeId,
+    /// Source span for error reporting
+    pub span: Option<Span>,
+}
+
 /// The type registry - single source of truth for all types
 pub struct TypeRegistry {
     /// All resolved types, indexed by TyId
@@ -152,6 +197,16 @@ pub struct TypeRegistry {
     next_id: AtomicU32,
     /// Next inference variable ID
     next_infer: AtomicU32,
+    /// All lifetimes, indexed by LifetimeId
+    lifetimes: RwLock<Vec<Lifetime>>,
+    /// Lifetime interning map
+    lifetime_intern_map: RwLock<HashMap<Lifetime, LifetimeId>>,
+    /// Next lifetime ID counter
+    next_lifetime_id: AtomicU32,
+    /// Next lifetime inference variable ID
+    next_lifetime_infer: AtomicU32,
+    /// Lifetime constraints collected during type checking
+    lifetime_constraints: RwLock<Vec<LifetimeConstraint>>,
     /// Struct definitions by name
     struct_defs: RwLock<HashMap<String, StructDef>>,
     /// Enum definitions by name
@@ -170,11 +225,16 @@ pub struct TypeRegistry {
 
 impl TypeRegistry {
     pub fn new() -> Self {
-        Self {
+        let registry = Self {
             types: RwLock::new(Vec::new()),
             intern_map: RwLock::new(HashMap::new()),
             next_id: AtomicU32::new(0),
             next_infer: AtomicU32::new(0),
+            lifetimes: RwLock::new(Vec::new()),
+            lifetime_intern_map: RwLock::new(HashMap::new()),
+            next_lifetime_id: AtomicU32::new(0),
+            next_lifetime_infer: AtomicU32::new(0),
+            lifetime_constraints: RwLock::new(Vec::new()),
             struct_defs: RwLock::new(HashMap::new()),
             enum_defs: RwLock::new(HashMap::new()),
             type_aliases: RwLock::new(HashMap::new()),
@@ -182,7 +242,65 @@ impl TypeRegistry {
             mono_instances: RwLock::new(HashMap::new()),
             expr_types: RwLock::new(HashMap::new()),
             local_types: RwLock::new(HashMap::new()),
+        };
+        // Pre-intern the static lifetime
+        registry.intern_lifetime(Lifetime::Static);
+        registry
+    }
+
+    /// Intern a lifetime, returning its unique ID
+    pub fn intern_lifetime(&self, lifetime: Lifetime) -> LifetimeId {
+        // Check if already interned
+        if let Some(&id) = self.lifetime_intern_map.read().get(&lifetime) {
+            return id;
         }
+
+        // Allocate new ID
+        let id = LifetimeId(self.next_lifetime_id.fetch_add(1, Ordering::Relaxed));
+        self.lifetimes.write().push(lifetime.clone());
+        self.lifetime_intern_map.write().insert(lifetime, id);
+        id
+    }
+
+    /// Get a lifetime by its ID
+    pub fn get_lifetime(&self, id: LifetimeId) -> Option<Lifetime> {
+        self.lifetimes.read().get(id.0 as usize).cloned()
+    }
+
+    /// Get the static lifetime ID (always ID 0)
+    pub fn static_lifetime(&self) -> LifetimeId {
+        LifetimeId(0)
+    }
+
+    /// Create a fresh lifetime inference variable
+    pub fn fresh_lifetime_infer(&self) -> LifetimeId {
+        let infer_id = self.next_lifetime_infer.fetch_add(1, Ordering::Relaxed);
+        self.intern_lifetime(Lifetime::Infer(infer_id))
+    }
+
+    /// Create an anonymous/elided lifetime
+    pub fn anonymous_lifetime(&self) -> LifetimeId {
+        self.intern_lifetime(Lifetime::Anonymous)
+    }
+
+    /// Create a named lifetime
+    pub fn named_lifetime(&self, name: &str) -> LifetimeId {
+        self.intern_lifetime(Lifetime::Named(name.to_string()))
+    }
+
+    /// Add a lifetime constraint: lhs must outlive rhs
+    pub fn add_lifetime_constraint(&self, lhs: LifetimeId, rhs: LifetimeId, span: Option<Span>) {
+        self.lifetime_constraints.write().push(LifetimeConstraint { lhs, rhs, span });
+    }
+
+    /// Get all lifetime constraints
+    pub fn get_lifetime_constraints(&self) -> Vec<LifetimeConstraint> {
+        self.lifetime_constraints.read().clone()
+    }
+
+    /// Clear lifetime constraints (e.g., after checking a function)
+    pub fn clear_lifetime_constraints(&self) {
+        self.lifetime_constraints.write().clear();
     }
 
     /// Initialize the registry from a crate's type definitions
@@ -324,8 +442,14 @@ impl TypeRegistry {
 
             TypeKind::Ref { lifetime, mutable, inner } => {
                 let inner_id = self.resolve_hir_type_with_subst(inner, subst);
+                // Convert HIR lifetime (Option<String>) to LifetimeId
+                let lifetime_id = match lifetime {
+                    Some(name) if name == "static" => self.static_lifetime(),
+                    Some(name) => self.named_lifetime(name),
+                    None => self.anonymous_lifetime(),
+                };
                 self.intern(Ty::Ref {
-                    lifetime: lifetime.clone(),
+                    lifetime: lifetime_id,
                     mutable: *mutable,
                     inner: inner_id,
                 })

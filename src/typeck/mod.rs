@@ -4,7 +4,7 @@
 
 use crate::error::{Diagnostic, DiagnosticEmitter, Result, Span};
 use crate::hir::*;
-use crate::ty::{Ty, TyId, TypeRegistry};
+use crate::ty::{Lifetime, LifetimeId, Ty, TyId, TypeRegistry};
 use indexmap::IndexMap;
 use parking_lot::RwLock;
 use rayon::prelude::*;
@@ -740,8 +740,10 @@ impl<'a> TypeChecker<'a> {
 
             ExprKind::Ref { mutable, expr: inner } => {
                 let inner_ty = self.check_expr(inner)?;
+                // Create a fresh lifetime inference variable for this reference
+                let lifetime = self.ctx.registry.fresh_lifetime_infer();
                 Ok(self.ctx.registry.intern(Ty::Ref {
-                    lifetime: None,
+                    lifetime,
                     mutable: *mutable,
                     inner: inner_ty,
                 }))
@@ -843,8 +845,9 @@ impl<'a> TypeChecker<'a> {
             }
             Literal::Str(_) => {
                 let str_ty = self.ctx.registry.intern(Ty::Str);
+                let static_lifetime = self.ctx.registry.static_lifetime();
                 self.ctx.registry.intern(Ty::Ref {
-                    lifetime: Some("static".to_string()),
+                    lifetime: static_lifetime,
                     mutable: false,
                     inner: str_ty,
                 })
@@ -855,8 +858,9 @@ impl<'a> TypeChecker<'a> {
                     elem: u8_ty,
                     len: bytes.len(),
                 });
+                let static_lifetime = self.ctx.registry.static_lifetime();
                 self.ctx.registry.intern(Ty::Ref {
-                    lifetime: Some("static".to_string()),
+                    lifetime: static_lifetime,
                     mutable: false,
                     inner: arr_ty,
                 })
