@@ -255,20 +255,37 @@ impl CodeGenerator {
             path.segments.last().map(|s| s.ident.clone()).unwrap_or_default()
         });
 
-        // Build method map by scanning functions with Type_method naming convention
+        // Build method map from actual DefIds in the impl block
         let mut methods = HashMap::new();
-        for (_, item) in &krate.items {
-            if let ItemKind::Function(_) = &item.kind {
-                // Check if this is a method for this type
-                if item.name.starts_with(&format!("{}_", type_name)) {
-                    let method_name = item.name.strip_prefix(&format!("{}_", type_name))
-                        .unwrap_or(&item.name)
-                        .to_string();
-                    if let Some(&func_id) = self.func_ids.get(&item.id) {
+        for &method_def_id in &i.items {
+            if let Some(method_item) = krate.items.get(&method_def_id) {
+                if let ItemKind::Function(_) = &method_item.kind {
+                    let method_name = method_item.name.clone();
+                    if let Some(&func_id) = self.func_ids.get(&method_def_id) {
                         methods.insert(method_name, MethodImpl {
                             func_id,
-                            func_name: item.name.clone(),
+                            func_name: method_item.name.clone(),
                         });
+                    }
+                }
+            }
+        }
+
+        // Fallback: scan for Type_method naming convention for compatibility
+        let prefix = format!("{}_", type_name);
+        for (_, item) in &krate.items {
+            if let ItemKind::Function(_) = &item.kind {
+                if item.name.starts_with(&prefix) {
+                    let method_name = item.name.strip_prefix(&prefix)
+                        .unwrap_or(&item.name)
+                        .to_string();
+                    if !methods.contains_key(&method_name) {
+                        if let Some(&func_id) = self.func_ids.get(&item.id) {
+                            methods.insert(method_name, MethodImpl {
+                                func_id,
+                                func_name: item.name.clone(),
+                            });
+                        }
                     }
                 }
             }

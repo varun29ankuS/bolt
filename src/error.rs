@@ -436,3 +436,156 @@ impl DiagnosticReport {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
     }
 }
+
+// ============================================================================
+// Compilation Progress Reporting (LLM-Friendly)
+// ============================================================================
+
+/// Compilation phase for progress tracking
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompilationPhase {
+    Parsing,
+    TypeCollection,
+    TypeChecking,
+    BorrowChecking,
+    MonomorphizationCollection,
+    MonomorphizationCodegen,
+    Codegen,
+    Linking,
+    Execution,
+}
+
+impl CompilationPhase {
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::Parsing => "Parsing source code",
+            Self::TypeCollection => "Collecting type definitions",
+            Self::TypeChecking => "Type checking",
+            Self::BorrowChecking => "Borrow checking",
+            Self::MonomorphizationCollection => "Collecting generic instantiations",
+            Self::MonomorphizationCodegen => "Generating monomorphized functions",
+            Self::Codegen => "Generating machine code",
+            Self::Linking => "Linking",
+            Self::Execution => "Executing",
+        }
+    }
+
+    pub fn is_parallelizable(&self) -> bool {
+        matches!(
+            self,
+            Self::TypeCollection | Self::MonomorphizationCodegen | Self::Codegen
+        )
+    }
+}
+
+/// Progress update for LLM consumption
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgressUpdate {
+    /// Current compilation phase
+    pub phase: CompilationPhase,
+    /// Human-readable status message
+    pub message: String,
+    /// Progress percentage (0-100, None if indeterminate)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub percent: Option<u8>,
+    /// Current item being processed (e.g., function name)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_item: Option<String>,
+    /// Total items in this phase
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_items: Option<usize>,
+    /// Items completed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_items: Option<usize>,
+    /// Whether this phase runs in parallel
+    #[serde(default)]
+    pub parallel: bool,
+    /// Elapsed time in milliseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+}
+
+impl ProgressUpdate {
+    pub fn new(phase: CompilationPhase) -> Self {
+        Self {
+            phase,
+            message: phase.description().to_string(),
+            percent: None,
+            current_item: None,
+            total_items: None,
+            completed_items: None,
+            parallel: phase.is_parallelizable(),
+            elapsed_ms: None,
+        }
+    }
+
+    pub fn with_message(mut self, msg: impl Into<String>) -> Self {
+        self.message = msg.into();
+        self
+    }
+
+    pub fn with_progress(mut self, completed: usize, total: usize) -> Self {
+        self.completed_items = Some(completed);
+        self.total_items = Some(total);
+        self.percent = if total > 0 {
+            Some(((completed as f64 / total as f64) * 100.0) as u8)
+        } else {
+            None
+        };
+        self
+    }
+
+    pub fn with_item(mut self, item: impl Into<String>) -> Self {
+        self.current_item = Some(item.into());
+        self
+    }
+
+    pub fn with_elapsed(mut self, ms: u64) -> Self {
+        self.elapsed_ms = Some(ms);
+        self
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
+    }
+}
+
+/// Complete compilation result for LLM consumption
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompilationResult {
+    /// Whether compilation succeeded
+    pub success: bool,
+    /// File that was compiled
+    pub file: PathBuf,
+    /// Phases that were executed
+    pub phases_completed: Vec<CompilationPhase>,
+    /// Total compilation time in milliseconds
+    pub total_time_ms: u64,
+    /// Execution result (if code was run)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_result: Option<i64>,
+    /// All diagnostics
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<JsonDiagnostic>,
+    /// Summary
+    pub summary: CompilationSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompilationSummary {
+    pub errors: usize,
+    pub warnings: usize,
+    pub functions_compiled: usize,
+    pub types_registered: usize,
+}
+
+impl CompilationResult {
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    pub fn to_json_pretty(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
+    }
+}
