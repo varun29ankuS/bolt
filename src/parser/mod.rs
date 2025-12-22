@@ -185,6 +185,10 @@ mod tests {
     fn test_line_starts() {
         let content = "fn main() {\n    println!(\"hello\");\n}\n";
         let starts = compute_line_starts(content);
-        assert_eq!(starts, vec![0, 12, 34, 36]);
+        // Line 1: "fn main() {\n" = 12 chars, starts at 0
+        // Line 2: "    println!(\"hello\");\n" = 23 chars, starts at 12
+        // Line 3: "}\n" = 2 chars, starts at 35
+        // Line 4 (after final newline): starts at 37
+        assert_eq!(starts, vec![0, 12, 35, 37]);
     }
 }

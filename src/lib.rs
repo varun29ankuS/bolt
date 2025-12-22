@@ -1,10 +1,10 @@
 //! Bolt - Lightning-fast Rust compiler for development
 //!
 //! Architecture:
-//! ```
-//! Source → Parse → Type Check → Borrow Check → Codegen → Execute/Binary
-//!            ↓         ↓            ↓             ↓
-//!         parallel  parallel     parallel      parallel
+//! ```text
+//! Source -> Parse -> Type Check -> Borrow Check -> Codegen -> Execute/Binary
+//!             |          |             |              |
+//!          parallel   parallel      parallel       parallel
 //! ```
 
 pub mod parser;
