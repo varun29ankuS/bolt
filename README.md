@@ -2,7 +2,7 @@
 
 **Lightning-fast Rust compiler for development.**
 
-Bolt is an experimental Rust compiler that prioritizes iteration speed over production optimization. It compiles and runs Rust code **100-200x faster** than `rustc`/`cargo` by using Cranelift JIT instead of LLVM.
+Bolt is an experimental Rust compiler that prioritizes iteration speed over production optimization. It compiles and runs Rust code **100-200x faster** than `rustc`/`cargo` by using Cranelift JIT instead of LLVM, with a vision for **async safety checking** and **expression-level incremental compilation**.
 
 ## Benchmarks
 
@@ -21,182 +21,185 @@ rustc: ████████████████████████�
 ## Installation
 
 ```bash
-# Clone and build
-git clone https://github.com/user/bolt.git
+git clone https://github.com/varun29ankuS/bolt.git
 cd bolt
 cargo build --release
-
-# Run
 ./target/release/bolt run your_file.rs
 ```
 
 ## Usage
 
 ```bash
-# Run a Rust file (compile + execute)
-bolt run main.rs
-
-# Check for errors (no codegen)
-bolt check main.rs
-
-# Build without running
-bolt build main.rs
-
-# LLM-friendly JSON output
-bolt check main.rs --format json
-bolt check main.rs --format json-pretty
-
-# Cache management
-bolt cache stats
-bolt cache clear
-bolt cache clean
+bolt run main.rs              # Compile + execute
+bolt check main.rs            # Check for errors (no codegen)
+bolt build main.rs            # Build without running
+bolt check main.rs -f json    # LLM-friendly JSON output
+bolt cache stats              # Cache statistics
 ```
 
-## Architecture
+## Vision & Architecture
+
+Bolt isn't just "rustc but faster" - it rethinks the compilation model for development iteration.
+
+### Core Innovations
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Bolt Pipeline                            │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│   Source.rs                                                     │
-│       │                                                         │
-│       ▼                                                         │
-│   ┌───────────┐                                                 │
-│   │  Parser   │  syn crate → AST                                │
-│   └─────┬─────┘                                                 │
-│         │                                                       │
-│         ▼                                                       │
-│   ┌───────────┐                                                 │
-│   │  Lowering │  AST → HIR (High-level IR)                      │
-│   └─────┬─────┘                                                 │
-│         │                                                       │
-│         ▼                                                       │
-│   ┌───────────┐     ┌──────────────┐                            │
-│   │  TypeCk   │────▶│ TypeRegistry │  Unified type system       │
-│   └─────┬─────┘     └──────────────┘                            │
-│         │                                                       │
-│         ▼                                                       │
-│   ┌───────────┐                                                 │
-│   │ BorrowCk  │  Move/borrow analysis                           │
-│   └─────┬─────┘                                                 │
-│         │                                                       │
-│         ▼                                                       │
-│   ┌───────────┐                                                 │
-│   │  Codegen  │  Cranelift JIT                                  │
-│   └─────┬─────┘                                                 │
-│         │                                                       │
-│         ▼                                                       │
-│      Execute                                                    │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           BOLT ARCHITECTURE                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                        FAST PATH (~1ms)                             │   │
+│   │                                                                     │   │
+│   │   Source ──▶ Parse ──▶ HIR ──▶ TypeCheck ──▶ Codegen ──▶ Execute   │   │
+│   │                         │                       │                   │   │
+│   └─────────────────────────┼───────────────────────┼───────────────────┘   │
+│                             │                       │                       │
+│   ┌─────────────────────────▼───────────────────────▼───────────────────┐   │
+│   │                    BACKGROUND (async)                               │   │
+│   │                                                                     │   │
+│   │   ┌──────────────┐    ┌─────────────────┐    ┌──────────────────┐   │   │
+│   │   │  BorrowCheck │    │  Speculative    │    │   Cache/mmap     │   │   │
+│   │   │  (eventual)  │    │  Monomorph      │    │   IR fragments   │   │   │
+│   │   └──────────────┘    └─────────────────┘    └──────────────────┘   │   │
+│   │         │                                                           │   │
+│   │         ▼                                                           │   │
+│   │   Warnings surface async (next compile blocks if unsafe)            │   │
+│   │                                                                     │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                    PERSISTENT CACHE                                 │   │
+│   │                                                                     │   │
+│   │   ┌────────────────┐  ┌────────────────┐  ┌─────────────────────┐   │   │
+│   │   │ Expression IR  │  │ Mono instances │  │ mmap'd HIR (skip    │   │   │
+│   │   │ fragments      │  │ Vec<i32>, etc  │  │ parsing entirely)   │   │   │
+│   │   └────────────────┘  └────────────────┘  └─────────────────────┘   │   │
+│   │                                                                     │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Features
+### 1. Compile First, Verify Later
 
-### Implemented
+Traditional: `Parse → Type → Borrow → Codegen → Run` (all blocking)
 
-- **Core Language**
-  - Functions, structs, enums, tuples
-  - Generics with monomorphization
-  - Pattern matching
-  - References and borrowing
-  - Heap allocation (malloc/free)
-  - Closures
-
-- **Type System**
-  - Full type inference
-  - Unified TypeRegistry shared across passes
-  - Generic type resolution
-  - Struct/enum field access
-
-- **Developer Experience**
-  - LLM-friendly JSON diagnostics (BOL-15)
-  - Error codes matching rustc (E0382, E0499, etc.)
-  - Colored terminal output
-  - Compilation caching
-
-- **Syntax Support**
-  - `use` statements with all patterns
-  - `Result<T, E>` and `?` operator
-  - `#[derive(...)]` macros (Default, Clone, Copy)
-  - String literals and print functions
-
-### Roadmap
-
-| Priority | Feature | Status | Linear |
-|----------|---------|--------|--------|
-| P0 | Self-hosting (Bolt compiles Bolt) | Backlog | BOL-44 |
-| P1 | Async borrow checking | Backlog | BOL-14 |
-| P1 | Trait method resolution | In Progress | - |
-| P2 | Expression-level incremental compilation | Backlog | BOL-26 |
-| P2 | Memory-mapped IR for instant startup | Backlog | BOL-27, BOL-41 |
-| P2 | FFI and extern support | Backlog | BOL-33 |
-| P3 | Built-in test framework | Backlog | BOL-36 |
-| P3 | Speculative monomorphization | Backlog | BOL-28 |
-
-## Design Philosophy
-
-### 1. Speed Over Optimization
-Bolt generates "good enough" code instantly rather than optimal code slowly. For development iteration, 1ms compile time beats 1% faster runtime.
-
-### 2. Compile First, Verify Later (Vision)
-The goal is to run code immediately while safety checks happen in the background:
+Bolt vision:
 ```
-Current:  Parse → Type → Borrow → Codegen → Run (serial)
-Goal:     Parse → Type → Codegen → Run  [Borrow checking async]
+Parse → Type → Codegen → Run     [~1ms, you see results]
+         └──▶ BorrowCheck        [async, warns if unsafe]
 ```
 
-### 3. LLM-Native Tooling
-Error output is structured for AI consumption:
-```json
-{
-  "level": "error",
-  "code": "borrow_of_moved_value",
-  "message": "borrow of moved value: `x`",
-  "location": {"file": "src/main.rs", "line": 10, "column": 5},
-  "suggestions": [{"message": "consider cloning", "replacement": "x.clone()"}]
+Code runs **immediately**. If borrow checker finds issues, they surface as warnings. Next compilation blocks only if previous check failed.
+
+### 2. Expression-Level Incremental Compilation
+
+rustc's incremental is function-level. Bolt aims for **expression-level**:
+
+```rust
+fn complex() -> i64 {
+    let a = expensive_op1();  // cached ✓
+    let b = expensive_op2();  // cached ✓
+    let c = a + b;            // CHANGED → recompile only this
+    let d = more_work(c);     // depends on c → recompile
+    d
 }
 ```
 
-### 4. Simplicity
-~8,000 lines of Rust. No complex build system, no proc-macro server, no incremental compilation database (yet).
+Each expression hashed by AST + dependencies. Only recompile what changed.
+
+### 3. Speculative Monomorphization
+
+Pre-compile common generic instantiations before they're needed:
+
+```
+Background thread profiles usage:
+  Vec<i32>     → pre-compiled ✓
+  Option<String> → pre-compiled ✓
+  HashMap<K,V> → ready when you need it
+```
+
+When your code calls `Vec::new()`, the compiled version is already waiting.
+
+### 4. Memory-Mapped IR
+
+Skip parsing entirely for unchanged files:
+
+```
+Traditional: Load → Parse → Typecheck → Codegen  [2ms]
+With mmap:   mmap cached HIR → Codegen           [0.05ms]
+```
+
+Persist compiled IR to disk. Memory-map it back. Zero deserialization.
+
+## Current Status
+
+### Implemented ✓
+
+- **Core Language**: Functions, structs, enums, generics, pattern matching, closures
+- **Type System**: Full inference, unified TypeRegistry, monomorphization
+- **LLM Diagnostics**: JSON output with error codes, suggestions, confidence levels
+- **Syntax**: `use`, `Result<T,E>`, `?` operator, `#[derive(...)]`
+
+### In Progress
+
+- Trait method resolution
+- Expression type tracking for codegen
+
+### Roadmap
+
+| Stage | Feature | Impact |
+|-------|---------|--------|
+| **Now** | Trait methods, lifetimes | Core language completeness |
+| **Next** | Async borrow checker | Instant feedback, safety async |
+| **Then** | Expression-level incremental | Sub-millisecond warm compiles |
+| **Later** | Memory-mapped IR | 0.05ms startup |
+| **Goal** | Self-hosting (BOL-44) | Bolt compiles Bolt |
+
+## Success Metrics
+
+| Metric | Current | Target |
+|--------|---------|--------|
+| Cold compile | ~1.2ms | <5ms |
+| Warm compile | ~1.2ms | <0.5ms (expression-level) |
+| Startup (cached) | ~1ms | <0.1ms (mmap) |
+| Rust coverage | ~40% | 80% (self-hosting) |
 
 ## Project Structure
 
 ```
 bolt/
 ├── src/
-│   ├── main.rs           # Entry point
-│   ├── lib.rs            # Library exports
-│   ├── cli/mod.rs        # Command-line interface
-│   ├── parser/
-│   │   ├── mod.rs        # Parser using syn
-│   │   └── lower.rs      # AST → HIR lowering
-│   ├── hir.rs            # High-level IR definitions
-│   ├── ty/mod.rs         # Unified type system
-│   ├── typeck/mod.rs     # Type checking
-│   ├── borrowck/mod.rs   # Borrow checking
-│   ├── codegen/mod.rs    # Cranelift code generation
+│   ├── cli/mod.rs        # CLI with JSON output support
+│   ├── parser/           # syn-based parser + HIR lowering
+│   ├── hir.rs            # High-level IR
+│   ├── ty/mod.rs         # Unified type system (shared typeck↔codegen)
+│   ├── typeck/mod.rs     # Type inference and checking
+│   ├── borrowck/mod.rs   # Borrow checking (to become async)
+│   ├── codegen/mod.rs    # Cranelift JIT
 │   ├── cache/mod.rs      # Compilation caching
-│   └── error.rs          # Diagnostics and error types
+│   └── error.rs          # LLM-friendly diagnostics
 └── test/                 # Test programs
 ```
 
-## Why Not Just Use rustc?
+## Why Bolt?
 
 | | rustc | Bolt |
 |---|---|---|
-| **Goal** | Production binaries | Development speed |
-| **Backend** | LLVM (slow, optimal) | Cranelift (fast, good) |
-| **Startup** | ~100ms minimum | ~1ms |
-| **Use case** | Ship to users | Iterate locally |
+| **Philosophy** | Correctness first | Speed first, correctness async |
+| **Backend** | LLVM (optimal, slow) | Cranelift (good, fast) |
+| **Incremental** | Function-level | Expression-level (planned) |
+| **Safety check** | Blocking | Async (planned) |
+| **Target** | Production | Development |
 
-Bolt is not a replacement for rustc. Use Bolt for `cargo run` equivalents during development, use rustc/cargo for releases.
+Bolt is your development compiler. rustc is your release compiler.
 
-## Contributing
+## Links
 
-See [Linear project](https://linear.app/shodh-memory/project/bolt) for tracked issues and roadmap.
+- [Linear Project](https://linear.app/shodh-memory/project/bolt) - Issues and roadmap
+- [BOL-14](https://linear.app/shodh-memory/issue/BOL-14) - Async borrow checking vision
+- [BOL-44](https://linear.app/shodh-memory/issue/BOL-44) - Self-hosting milestone
 
 ## License
 
