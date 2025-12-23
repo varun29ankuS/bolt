@@ -19,10 +19,18 @@ use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Field information for struct layout
+#[derive(Clone)]
+struct FieldInfo {
+    offset: usize,
+    type_name: String,  // Type name for the field (e.g., "i64", "Inner")
+    is_struct: bool,    // True if field is a struct type
+}
+
 /// Field offset information for a struct
 #[derive(Clone)]
 struct StructLayout {
-    fields: IndexMap<String, usize>,  // field name -> offset
+    fields: IndexMap<String, FieldInfo>,  // field name -> field info
     size: usize,
 }
 
@@ -107,6 +115,50 @@ impl CodeGenerator {
         builder.symbol("bolt_print_int", bolt_print_int as *const u8);
         builder.symbol("bolt_print_str", bolt_print_str as *const u8);
 
+        // Register Vec runtime functions
+        builder.symbol("bolt_vec_new", crate::runtime::bolt_vec_new as *const u8);
+        builder.symbol("bolt_vec_with_capacity", crate::runtime::bolt_vec_with_capacity as *const u8);
+        builder.symbol("bolt_vec_push", crate::runtime::bolt_vec_push as *const u8);
+        builder.symbol("bolt_vec_get", crate::runtime::bolt_vec_get as *const u8);
+        builder.symbol("bolt_vec_get_mut", crate::runtime::bolt_vec_get_mut as *const u8);
+        builder.symbol("bolt_vec_len", crate::runtime::bolt_vec_len as *const u8);
+        builder.symbol("bolt_vec_capacity", crate::runtime::bolt_vec_capacity as *const u8);
+        builder.symbol("bolt_vec_is_empty", crate::runtime::bolt_vec_is_empty as *const u8);
+        builder.symbol("bolt_vec_pop", crate::runtime::bolt_vec_pop as *const u8);
+        builder.symbol("bolt_vec_clear", crate::runtime::bolt_vec_clear as *const u8);
+        builder.symbol("bolt_vec_drop", crate::runtime::bolt_vec_drop as *const u8);
+        builder.symbol("bolt_vec_from_slice", crate::runtime::bolt_vec_from_slice as *const u8);
+        builder.symbol("bolt_vec_iter", crate::runtime::bolt_vec_iter as *const u8);
+        builder.symbol("bolt_vec_iter_next", crate::runtime::bolt_vec_iter_next as *const u8);
+        builder.symbol("bolt_vec_sum_i64", crate::runtime::bolt_vec_sum_i64 as *const u8);
+        builder.symbol("bolt_vec_sum_i32", crate::runtime::bolt_vec_sum_i32 as *const u8);
+        builder.symbol("bolt_vec_sum_f64", crate::runtime::bolt_vec_sum_f64 as *const u8);
+
+        // Register String runtime functions
+        builder.symbol("bolt_string_new", crate::runtime::bolt_string_new as *const u8);
+        builder.symbol("bolt_string_from_utf8", crate::runtime::bolt_string_from_utf8 as *const u8);
+        builder.symbol("bolt_string_len", crate::runtime::bolt_string_len as *const u8);
+        builder.symbol("bolt_string_as_ptr", crate::runtime::bolt_string_as_ptr as *const u8);
+        builder.symbol("bolt_string_push_byte", crate::runtime::bolt_string_push_byte as *const u8);
+        builder.symbol("bolt_string_push_str", crate::runtime::bolt_string_push_str as *const u8);
+        builder.symbol("bolt_string_drop", crate::runtime::bolt_string_drop as *const u8);
+
+        // Register Box runtime functions
+        builder.symbol("bolt_box_new", crate::runtime::bolt_box_new as *const u8);
+        builder.symbol("bolt_box_drop", crate::runtime::bolt_box_drop as *const u8);
+
+        // Register I/O functions
+        builder.symbol("bolt_print_i64", crate::runtime::bolt_print_i64 as *const u8);
+        builder.symbol("bolt_print_u64", crate::runtime::bolt_print_u64 as *const u8);
+        builder.symbol("bolt_print_f64", crate::runtime::bolt_print_f64 as *const u8);
+        builder.symbol("bolt_print_newline", crate::runtime::bolt_print_newline as *const u8);
+        builder.symbol("bolt_print_bool", crate::runtime::bolt_print_bool as *const u8);
+        builder.symbol("bolt_print_char", crate::runtime::bolt_print_char as *const u8);
+
+        // Register panic functions
+        builder.symbol("bolt_panic", crate::runtime::bolt_panic as *const u8);
+        builder.symbol("bolt_abort", crate::runtime::bolt_abort as *const u8);
+
         let module = JITModule::new(builder);
         let ctx = module.make_context();
 
@@ -186,51 +238,71 @@ impl CodeGenerator {
     }
 
     fn declare_runtime_functions(&mut self) -> Result<()> {
-        // bolt_malloc(size: i64) -> i64 (pointer)
-        let mut malloc_sig = self.module.make_signature();
-        malloc_sig.params.push(AbiParam::new(types::I64));
-        malloc_sig.returns.push(AbiParam::new(types::I64));
-        let malloc_id = self.module
-            .declare_function("bolt_malloc", Linkage::Import, &malloc_sig)
-            .map_err(|e| BoltError::Codegen { message: format!("Failed to declare bolt_malloc: {}", e) })?;
-        self.func_names.insert("bolt_malloc".to_string(), malloc_id);
+        // Helper to declare a function
+        macro_rules! declare_fn {
+            ($name:expr, [$($param:expr),*], [$($ret:expr),*]) => {{
+                let mut sig = self.module.make_signature();
+                $(sig.params.push(AbiParam::new($param));)*
+                $(sig.returns.push(AbiParam::new($ret));)*
+                let id = self.module
+                    .declare_function($name, Linkage::Import, &sig)
+                    .map_err(|e| BoltError::Codegen { message: format!("Failed to declare {}: {}", $name, e) })?;
+                self.func_names.insert($name.to_string(), id);
+            }};
+        }
 
-        // bolt_free(ptr: i64, size: i64)
-        let mut free_sig = self.module.make_signature();
-        free_sig.params.push(AbiParam::new(types::I64));
-        free_sig.params.push(AbiParam::new(types::I64));
-        let free_id = self.module
-            .declare_function("bolt_free", Linkage::Import, &free_sig)
-            .map_err(|e| BoltError::Codegen { message: format!("Failed to declare bolt_free: {}", e) })?;
-        self.func_names.insert("bolt_free".to_string(), free_id);
+        // Basic allocation
+        declare_fn!("bolt_malloc", [types::I64], [types::I64]);
+        declare_fn!("bolt_free", [types::I64, types::I64], []);
+        declare_fn!("bolt_realloc", [types::I64, types::I64, types::I64], [types::I64]);
 
-        // bolt_realloc(ptr: i64, old_size: i64, new_size: i64) -> i64
-        let mut realloc_sig = self.module.make_signature();
-        realloc_sig.params.push(AbiParam::new(types::I64));
-        realloc_sig.params.push(AbiParam::new(types::I64));
-        realloc_sig.params.push(AbiParam::new(types::I64));
-        realloc_sig.returns.push(AbiParam::new(types::I64));
-        let realloc_id = self.module
-            .declare_function("bolt_realloc", Linkage::Import, &realloc_sig)
-            .map_err(|e| BoltError::Codegen { message: format!("Failed to declare bolt_realloc: {}", e) })?;
-        self.func_names.insert("bolt_realloc".to_string(), realloc_id);
+        // Legacy print functions
+        declare_fn!("bolt_print_int", [types::I64], []);
+        declare_fn!("bolt_print_str", [types::I64, types::I64], []);
 
-        // bolt_print_int(value: i64)
-        let mut print_int_sig = self.module.make_signature();
-        print_int_sig.params.push(AbiParam::new(types::I64));
-        let print_int_id = self.module
-            .declare_function("bolt_print_int", Linkage::Import, &print_int_sig)
-            .map_err(|e| BoltError::Codegen { message: format!("Failed to declare bolt_print_int: {}", e) })?;
-        self.func_names.insert("bolt_print_int".to_string(), print_int_id);
+        // Vec functions
+        // bolt_vec_new() -> (ptr, len, cap) as 3 i64s returned via struct return
+        // For simplicity, we return ptr to stack-allocated struct
+        declare_fn!("bolt_vec_new", [], [types::I64, types::I64, types::I64]);
+        declare_fn!("bolt_vec_with_capacity", [types::I64, types::I64], [types::I64, types::I64, types::I64]);
+        declare_fn!("bolt_vec_push", [types::I64, types::I64, types::I64], []);
+        declare_fn!("bolt_vec_get", [types::I64, types::I64, types::I64], [types::I64]);
+        declare_fn!("bolt_vec_get_mut", [types::I64, types::I64, types::I64], [types::I64]);
+        declare_fn!("bolt_vec_len", [types::I64], [types::I64]);
+        declare_fn!("bolt_vec_capacity", [types::I64], [types::I64]);
+        declare_fn!("bolt_vec_is_empty", [types::I64], [types::I8]);
+        declare_fn!("bolt_vec_pop", [types::I64, types::I64], [types::I64]);
+        declare_fn!("bolt_vec_clear", [types::I64], []);
+        declare_fn!("bolt_vec_drop", [types::I64, types::I64], []);
+        declare_fn!("bolt_vec_from_slice", [types::I64, types::I64, types::I64], [types::I64, types::I64, types::I64]);
+        declare_fn!("bolt_vec_sum_i64", [types::I64], [types::I64]);
+        declare_fn!("bolt_vec_sum_i32", [types::I64], [types::I32]);
+        declare_fn!("bolt_vec_sum_f64", [types::I64], [types::F64]);
 
-        // bolt_print_str(ptr: i64, len: i64)
-        let mut print_str_sig = self.module.make_signature();
-        print_str_sig.params.push(AbiParam::new(types::I64));
-        print_str_sig.params.push(AbiParam::new(types::I64));
-        let print_str_id = self.module
-            .declare_function("bolt_print_str", Linkage::Import, &print_str_sig)
-            .map_err(|e| BoltError::Codegen { message: format!("Failed to declare bolt_print_str: {}", e) })?;
-        self.func_names.insert("bolt_print_str".to_string(), print_str_id);
+        // String functions
+        declare_fn!("bolt_string_new", [], [types::I64, types::I64, types::I64]);
+        declare_fn!("bolt_string_from_utf8", [types::I64, types::I64], [types::I64, types::I64, types::I64]);
+        declare_fn!("bolt_string_len", [types::I64], [types::I64]);
+        declare_fn!("bolt_string_as_ptr", [types::I64], [types::I64]);
+        declare_fn!("bolt_string_push_byte", [types::I64, types::I8], []);
+        declare_fn!("bolt_string_push_str", [types::I64, types::I64, types::I64], []);
+        declare_fn!("bolt_string_drop", [types::I64], []);
+
+        // Box functions
+        declare_fn!("bolt_box_new", [types::I64, types::I64], [types::I64]);
+        declare_fn!("bolt_box_drop", [types::I64, types::I64, types::I64], []);
+
+        // I/O functions
+        declare_fn!("bolt_print_i64", [types::I64], []);
+        declare_fn!("bolt_print_u64", [types::I64], []);
+        declare_fn!("bolt_print_f64", [types::F64], []);
+        declare_fn!("bolt_print_newline", [], []);
+        declare_fn!("bolt_print_bool", [types::I8], []);
+        declare_fn!("bolt_print_char", [types::I32], []);
+
+        // Panic/abort
+        declare_fn!("bolt_panic", [types::I64, types::I64], []);
+        declare_fn!("bolt_abort", [], []);
 
         Ok(())
     }
@@ -306,6 +378,30 @@ impl CodeGenerator {
             TypeKind::Path(path) => {
                 path.segments.last().map(|s| s.ident.clone()).unwrap_or_default()
             }
+            TypeKind::Int(int_ty) => {
+                use crate::hir::IntType;
+                match int_ty {
+                    IntType::I8 => "i8".to_string(),
+                    IntType::I16 => "i16".to_string(),
+                    IntType::I32 => "i32".to_string(),
+                    IntType::I64 => "i64".to_string(),
+                    IntType::I128 => "i128".to_string(),
+                    IntType::Isize => "isize".to_string(),
+                }
+            }
+            TypeKind::Uint(uint_ty) => {
+                use crate::hir::UintType;
+                match uint_ty {
+                    UintType::U8 => "u8".to_string(),
+                    UintType::U16 => "u16".to_string(),
+                    UintType::U32 => "u32".to_string(),
+                    UintType::U64 => "u64".to_string(),
+                    UintType::U128 => "u128".to_string(),
+                    UintType::Usize => "usize".to_string(),
+                }
+            }
+            TypeKind::Bool => "bool".to_string(),
+            TypeKind::Str => "str".to_string(),
             _ => String::new(),
         }
     }
@@ -313,15 +409,55 @@ impl CodeGenerator {
     fn register_struct(&mut self, name: &str, s: &Struct) {
         let mut fields = IndexMap::new();
         let mut offset = 0usize;
-        
+
         if let StructKind::Named(ref field_list) = s.kind {
             for field in field_list {
-                fields.insert(field.name.clone(), offset);
-                offset += 8;  // All fields are 8 bytes for now
+                // Get field type name
+                let type_name = self.type_to_name(&field.ty);
+                // Check if field is a struct type
+                let is_struct = self.struct_layouts.contains_key(&type_name);
+                // Get actual field size - nested structs use their full size
+                let field_size = self.get_type_size(&field.ty);
+
+                fields.insert(field.name.clone(), FieldInfo {
+                    offset,
+                    type_name,
+                    is_struct,
+                });
+                offset += field_size;
             }
         }
-        
+
         self.struct_layouts.insert(name.to_string(), StructLayout { fields, size: offset });
+    }
+
+    /// Get the size of a type in bytes
+    fn get_type_size(&self, ty: &HirType) -> usize {
+        match &ty.kind {
+            TypeKind::Path(path) => {
+                if let Some(seg) = path.segments.first() {
+                    let type_name = &seg.ident;
+                    // Check if it's a known struct type
+                    if let Some(layout) = self.struct_layouts.get(type_name) {
+                        return layout.size;
+                    }
+                    // Primitives and references are 8 bytes
+                    match type_name.as_str() {
+                        "i64" | "u64" | "f64" | "isize" | "usize" | "bool" => 8,
+                        "i32" | "u32" | "f32" => 8,  // Align to 8 for simplicity
+                        "i16" | "u16" => 8,
+                        "i8" | "u8" => 8,
+                        _ => 8,  // Default to pointer size
+                    }
+                } else {
+                    8
+                }
+            }
+            TypeKind::Ref { .. } => 8,  // References are pointer-sized
+            TypeKind::Slice(_) | TypeKind::Array { .. } => 16,  // ptr + len
+            TypeKind::Tuple(elements) => elements.len() * 8,
+            _ => 8,
+        }
     }
 
     fn register_enum(&mut self, name: &str, e: &Enum) {
@@ -384,9 +520,12 @@ impl CodeGenerator {
 
         self.ctx.func.signature = self.module.declarations().get_function_decl(func_id).signature.clone();
 
-        // Pre-compute Cranelift types for parameters before creating builder
+        // Pre-compute Cranelift types and type names for parameters before creating builder
         let param_types: Vec<types::Type> = func.sig.inputs.iter()
             .map(|(_, ty)| self.type_to_cl(ty))
+            .collect();
+        let param_type_names: Vec<String> = func.sig.inputs.iter()
+            .map(|(_, ty)| self.type_to_name(ty))
             .collect();
 
         let mut builder_ctx = FunctionBuilderContext::new();
@@ -413,12 +552,16 @@ impl CodeGenerator {
         let mut translator = FunctionTranslator::new(builder, &self.type_registry, &self.func_ids, &self.func_names, &mut self.module, &self.struct_layouts, &self.enum_layouts, &self.type_impls, &self.imports);
         translator.sret_ptr = sret_ptr;
 
-        for (((param_name, _), val), cl_ty) in func.sig.inputs.iter().zip(param_values).zip(param_types) {
+        for (((param_name, _), val), (cl_ty, type_name)) in func.sig.inputs.iter().zip(param_values).zip(param_types.into_iter().zip(param_type_names)) {
             let var = Variable::from_u32(translator.next_var as u32);
             translator.next_var += 1;
             translator.builder.declare_var(var, cl_ty);
             translator.builder.def_var(var, val);
             translator.locals.insert(param_name.clone(), LocalInfo { var, ty: cl_ty });
+            // Store type name for infer_type_name (needed for method calls on self)
+            if !type_name.is_empty() {
+                translator.local_types.insert(param_name.clone(), type_name);
+            }
         }
 
         if let Some(ref body) = func.body {
@@ -781,17 +924,44 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                 // Recursive - infer from receiver
                 self.infer_type_name(receiver)
             }
-            ExprKind::Field { expr: inner, .. } => {
-                // Field access - infer from inner
-                self.infer_type_name(inner)
+            ExprKind::Field { expr: inner, field } => {
+                // Field access - get the field's type from the base struct's layout
+                if let Some(base_type) = self.infer_type_name(inner) {
+                    if let Some(layout) = self.struct_layouts.get(&base_type) {
+                        if let Some(field_info) = layout.fields.get(field) {
+                            return Some(field_info.type_name.clone());
+                        }
+                    }
+                }
+                None
+            }
+            ExprKind::Index { expr: base, .. } => {
+                // Index access - infer element type from base
+                // For Vec<T>, the element type is T (but we just return the inner type for now)
+                let base_type = self.infer_type_name(base)?;
+                if base_type.starts_with("Vec<") && base_type.ends_with(">") {
+                    // Extract T from Vec<T>
+                    Some(base_type[4..base_type.len()-1].to_string())
+                } else {
+                    // For other types, we can't easily determine element type
+                    None
+                }
             }
             _ => None,
         }
     }
 
-    /// Resolve a method for a given type
+    /// Resolve a method for a given type using TypeRegistry's unified method table
     fn resolve_method(&self, type_name: &str, method_name: &str) -> Option<FuncId> {
-        // First check type_impls registry
+        // First try the TypeRegistry's method table (unified resolution with deref coercion)
+        if let Some(method_info) = self.type_registry.resolve_method_by_name(type_name, method_name, 0) {
+            // Look up FuncId using the DefId from the method table
+            if let Some(&func_id) = self.func_ids.get(&method_info.def_id) {
+                return Some(func_id);
+            }
+        }
+
+        // Fallback: check local type_impls registry (for impl blocks processed during codegen)
         if let Some(impls) = self.type_impls.get(type_name) {
             for impl_block in impls {
                 if let Some(method) = impl_block.methods.get(method_name) {
@@ -800,7 +970,7 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             }
         }
 
-        // Fallback to naming convention: Type_method
+        // Final fallback to naming convention: Type_method
         let mangled_name = format!("{}_{}", type_name, method_name);
         self.func_names.get(&mangled_name).copied()
     }
@@ -935,25 +1105,90 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                         let ptr = self.translate_expr(inner);
                         self.builder.ins().store(cranelift::prelude::MemFlags::new(), rhs_val, ptr, 0);
                     }
-                    // Handle indexed assignment: arr[i] = value
+                    // Handle indexed assignment: arr[i] = value or v[i] = value
                     ExprKind::Index { expr: base, index } => {
-                        let ptr = self.translate_expr(base);
+                        let base_type = self.infer_type_name(base);
                         let idx = self.translate_expr(index);
-                        let eight = self.builder.ins().iconst(types::I64, 8);
-                        let offset = self.builder.ins().imul(idx, eight);
-                        let addr = self.builder.ins().iadd(ptr, offset);
-                        self.builder.ins().store(cranelift::prelude::MemFlags::new(), rhs_val, addr, 0);
+
+                        // Check if base is a Vec (BoltVec layout)
+                        let is_vec = base_type.as_ref()
+                            .map(|t| t == "Vec" || t.starts_with("Vec<"))
+                            .unwrap_or(false);
+
+                        if is_vec {
+                            // Vec indexed assignment with bounds check
+                            let vec_ptr = self.translate_expr(base);
+
+                            // Load data pointer and length from Vec struct
+                            let data_ptr = self.builder.ins().load(
+                                types::I64,
+                                cranelift::prelude::MemFlags::new(),
+                                vec_ptr,
+                                0,
+                            );
+                            let len = self.builder.ins().load(
+                                types::I64,
+                                cranelift::prelude::MemFlags::new(),
+                                vec_ptr,
+                                8,
+                            );
+
+                            // Bounds check
+                            let in_bounds = self.builder.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+                            let ok_block = self.builder.create_block();
+                            let panic_block = self.builder.create_block();
+
+                            self.builder.ins().brif(in_bounds, ok_block, &[], panic_block, &[]);
+
+                            // Panic block
+                            self.builder.switch_to_block(panic_block);
+                            self.builder.seal_block(panic_block);
+                            let panic_msg = b"index out of bounds";
+                            let msg_len = panic_msg.len();
+                            let msg_slot = self.builder.create_sized_stack_slot(cranelift::prelude::StackSlotData::new(
+                                cranelift::prelude::StackSlotKind::ExplicitSlot,
+                                msg_len as u32,
+                                0,
+                            ));
+                            let msg_ptr = self.builder.ins().stack_addr(types::I64, msg_slot, 0);
+                            for (i, &byte) in panic_msg.iter().enumerate() {
+                                let byte_val = self.builder.ins().iconst(types::I8, byte as i64);
+                                self.builder.ins().store(cranelift::prelude::MemFlags::new(), byte_val, msg_ptr, i as i32);
+                            }
+                            let msg_len_val = self.builder.ins().iconst(types::I64, msg_len as i64);
+                            if let Some(&panic_fn) = self.func_names.get("bolt_panic") {
+                                let panic_ref = self.module.declare_func_in_func(panic_fn, self.builder.func);
+                                self.builder.ins().call(panic_ref, &[msg_ptr, msg_len_val]);
+                            }
+                            self.builder.ins().trap(cranelift::prelude::TrapCode::User(0));
+
+                            // OK block - do the store
+                            self.builder.switch_to_block(ok_block);
+                            self.builder.seal_block(ok_block);
+
+                            let elem_size = self.builder.ins().iconst(types::I64, 8);
+                            let offset = self.builder.ins().imul(idx, elem_size);
+                            let addr = self.builder.ins().iadd(data_ptr, offset);
+                            self.builder.ins().store(cranelift::prelude::MemFlags::new(), rhs_val, addr, 0);
+                        } else {
+                            // Raw array indexed assignment
+                            let ptr = self.translate_expr(base);
+                            let eight = self.builder.ins().iconst(types::I64, 8);
+                            let offset = self.builder.ins().imul(idx, eight);
+                            let addr = self.builder.ins().iadd(ptr, offset);
+                            self.builder.ins().store(cranelift::prelude::MemFlags::new(), rhs_val, addr, 0);
+                        }
                     }
                     // Handle field assignment: s.field = value
                     ExprKind::Field { expr: base, field } => {
                         let ptr = self.translate_expr(base);
                         for layout in self.struct_layouts.values() {
-                            if let Some(&offset) = layout.fields.get(field) {
+                            if let Some(field_info) = layout.fields.get(field) {
                                 self.builder.ins().store(
                                     cranelift::prelude::MemFlags::new(),
                                     rhs_val,
                                     ptr,
-                                    offset as i32,
+                                    field_info.offset as i32,
                                 );
                                 break;
                             }
@@ -1316,6 +1551,133 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                             }
                         }
 
+                        // Handle built-in Vec static methods
+                        if type_name == "Vec" {
+                            return match method_name.as_str() {
+                                "new" => {
+                                    // Vec::new() - allocate stack slot for BoltVec (24 bytes: ptr, len, cap)
+                                    let slot = self.builder.create_sized_stack_slot(cranelift::prelude::StackSlotData::new(
+                                        cranelift::prelude::StackSlotKind::ExplicitSlot,
+                                        24,
+                                        0,
+                                    ));
+                                    let vec_ptr = self.builder.ins().stack_addr(types::I64, slot, 0);
+                                    // Initialize to zero (null ptr, 0 len, 0 cap)
+                                    let zero = self.builder.ins().iconst(types::I64, 0);
+                                    self.builder.ins().store(cranelift::prelude::MemFlags::new(), zero, vec_ptr, 0);
+                                    self.builder.ins().store(cranelift::prelude::MemFlags::new(), zero, vec_ptr, 8);
+                                    self.builder.ins().store(cranelift::prelude::MemFlags::new(), zero, vec_ptr, 16);
+                                    vec_ptr
+                                }
+                                "with_capacity" => {
+                                    // Vec::with_capacity(n) - allocate with initial capacity
+                                    let cap = args.first()
+                                        .map(|arg| self.translate_expr(arg))
+                                        .unwrap_or_else(|| self.builder.ins().iconst(types::I64, 0));
+                                    let elem_size_const = 8i64;
+
+                                    // Allocate stack slot for BoltVec struct (24 bytes)
+                                    let slot = self.builder.create_sized_stack_slot(cranelift::prelude::StackSlotData::new(
+                                        cranelift::prelude::StackSlotKind::ExplicitSlot,
+                                        24,
+                                        0,
+                                    ));
+                                    let vec_struct_ptr = self.builder.ins().stack_addr(types::I64, slot, 0);
+
+                                    // Calculate total size: cap * elem_size
+                                    let elem_size = self.builder.ins().iconst(types::I64, elem_size_const);
+                                    let total_size = self.builder.ins().imul(cap, elem_size);
+
+                                    // Allocate heap memory for data
+                                    let alloc_fn = self.func_names.get("bolt_malloc")
+                                        .expect("bolt_malloc not registered");
+                                    let alloc_ref = self.module.declare_func_in_func(*alloc_fn, self.builder.func);
+                                    let alloc_call = self.builder.ins().call(alloc_ref, &[total_size]);
+                                    let data_ptr = self.builder.inst_results(alloc_call)[0];
+
+                                    // Store ptr, len=0, cap in the Vec struct
+                                    let zero = self.builder.ins().iconst(types::I64, 0);
+                                    self.builder.ins().store(cranelift::prelude::MemFlags::new(), data_ptr, vec_struct_ptr, 0);
+                                    self.builder.ins().store(cranelift::prelude::MemFlags::new(), zero, vec_struct_ptr, 8);
+                                    self.builder.ins().store(cranelift::prelude::MemFlags::new(), cap, vec_struct_ptr, 16);
+                                    vec_struct_ptr
+                                }
+                                _ => self.builder.ins().iconst(types::I64, 0)
+                            };
+                        }
+
+                        // Handle built-in String static methods
+                        if type_name == "String" {
+                            return match method_name.as_str() {
+                                "new" => {
+                                    // String::new() - same as Vec::new() for bytes
+                                    let slot = self.builder.create_sized_stack_slot(cranelift::prelude::StackSlotData::new(
+                                        cranelift::prelude::StackSlotKind::ExplicitSlot,
+                                        24,
+                                        0,
+                                    ));
+                                    let str_ptr = self.builder.ins().stack_addr(types::I64, slot, 0);
+                                    let zero = self.builder.ins().iconst(types::I64, 0);
+                                    self.builder.ins().store(cranelift::prelude::MemFlags::new(), zero, str_ptr, 0);
+                                    self.builder.ins().store(cranelift::prelude::MemFlags::new(), zero, str_ptr, 8);
+                                    self.builder.ins().store(cranelift::prelude::MemFlags::new(), zero, str_ptr, 16);
+                                    str_ptr
+                                }
+                                "from" => {
+                                    // String::from("literal") - create from string literal
+                                    if let Some(arg) = args.first() {
+                                        if let ExprKind::Lit(Literal::Str(s)) = &arg.kind {
+                                            let bytes = s.as_bytes();
+                                            let len = bytes.len();
+                                            let len_val = self.builder.ins().iconst(types::I64, len as i64);
+
+                                            // Allocate string struct slot (24 bytes: ptr, len, cap)
+                                            let slot = self.builder.create_sized_stack_slot(cranelift::prelude::StackSlotData::new(
+                                                cranelift::prelude::StackSlotKind::ExplicitSlot,
+                                                24,
+                                                0,
+                                            ));
+                                            let str_struct_ptr = self.builder.ins().stack_addr(types::I64, slot, 0);
+
+                                            if len == 0 {
+                                                // Empty string - just zero out the struct
+                                                let zero = self.builder.ins().iconst(types::I64, 0);
+                                                self.builder.ins().store(cranelift::prelude::MemFlags::new(), zero, str_struct_ptr, 0);
+                                                self.builder.ins().store(cranelift::prelude::MemFlags::new(), zero, str_struct_ptr, 8);
+                                                self.builder.ins().store(cranelift::prelude::MemFlags::new(), zero, str_struct_ptr, 16);
+                                            } else {
+                                                // Allocate heap memory for string data
+                                                let alloc_fn = self.func_names.get("bolt_malloc")
+                                                    .expect("bolt_malloc not registered");
+                                                let alloc_ref = self.module.declare_func_in_func(*alloc_fn, self.builder.func);
+                                                let alloc_call = self.builder.ins().call(alloc_ref, &[len_val]);
+                                                let heap_ptr = self.builder.inst_results(alloc_call)[0];
+
+                                                // Copy string literal bytes to heap (inline)
+                                                for i in 0..len {
+                                                    let byte_val = self.builder.ins().iconst(types::I8, bytes[i] as i64);
+                                                    self.builder.ins().store(
+                                                        cranelift::prelude::MemFlags::new(),
+                                                        byte_val,
+                                                        heap_ptr,
+                                                        i as i32,
+                                                    );
+                                                }
+
+                                                // Store ptr, len, cap in the String struct
+                                                self.builder.ins().store(cranelift::prelude::MemFlags::new(), heap_ptr, str_struct_ptr, 0);
+                                                self.builder.ins().store(cranelift::prelude::MemFlags::new(), len_val, str_struct_ptr, 8);
+                                                self.builder.ins().store(cranelift::prelude::MemFlags::new(), len_val, str_struct_ptr, 16);
+                                            }
+                                            return str_struct_ptr;
+                                        }
+                                    }
+                                    self.builder.ins().iconst(types::I64, 0)
+                                }
+                                _ => self.builder.ins().iconst(types::I64, 0)
+                            };
+                        }
+
                         // Check for struct static method: Point::new(x, y)
                         let mangled_name = format!("{}_{}", type_name, method_name);
                         if let Some(&func_id) = self.func_names.get(&mangled_name) {
@@ -1353,6 +1715,24 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
 
                         // First check if this name is an import alias
                         let resolved_name = self.imports.get(name).cloned().unwrap_or_else(|| name.clone());
+
+                        // Handle built-in print function
+                        if resolved_name == "print" && args.len() == 1 {
+                            let arg_val = self.translate_expr(&args[0]);
+                            let arg_ty = self.infer_expr_type(&args[0]);
+
+                            let fn_name = if arg_ty == types::F64 || arg_ty == types::F32 {
+                                "bolt_print_f64"
+                            } else {
+                                "bolt_print_i64"
+                            };
+
+                            if let Some(&func_id) = self.func_names.get(fn_name) {
+                                let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                                self.builder.ins().call(func_ref, &[arg_val]);
+                            }
+                            return self.builder.ins().iconst(types::I64, 0);
+                        }
 
                         if let Some(&func_id) = self.func_names.get(&resolved_name) {
                             // Get function reference
@@ -1403,6 +1783,16 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                 // First, try to infer the receiver type for proper method resolution
                 let type_name = self.infer_type_name(receiver);
                 let recv_val = self.translate_expr(receiver);
+
+                // Handle built-in Vec methods
+                if let Some(ref tn) = type_name {
+                    if tn == "Vec" || tn.starts_with("Vec<") {
+                        return self.translate_vec_method(recv_val, method, args);
+                    }
+                    if tn == "String" {
+                        return self.translate_string_method(recv_val, method, args);
+                    }
+                }
 
                 // Try to resolve the method using the type registry
                 if let Some(ref tn) = type_name {
@@ -1652,14 +2042,41 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
 
                         // Store each field
                         for (field_name, field_expr) in fields {
-                            if let Some(&offset) = layout.fields.get(field_name) {
-                                let val = self.translate_expr(field_expr);
-                                self.builder.ins().store(
-                                    cranelift::prelude::MemFlags::new(),
-                                    val,
-                                    ptr,
-                                    offset as i32,
-                                );
+                            if let Some(field_info) = layout.fields.get(field_name) {
+                                // Check if this field is a struct type
+                                let is_struct_field = self.struct_layouts.contains_key(&field_info.type_name);
+                                if is_struct_field {
+                                    // For struct fields, we need to copy the entire struct
+                                    // not just store a pointer
+                                    let src_ptr = self.translate_expr(field_expr);
+                                    if let Some(nested_layout) = self.struct_layouts.get(&field_info.type_name) {
+                                        // Copy each 8-byte chunk
+                                        for i in 0..(nested_layout.size / 8) {
+                                            let src_offset = (i * 8) as i32;
+                                            let val = self.builder.ins().load(
+                                                types::I64,
+                                                cranelift::prelude::MemFlags::new(),
+                                                src_ptr,
+                                                src_offset,
+                                            );
+                                            self.builder.ins().store(
+                                                cranelift::prelude::MemFlags::new(),
+                                                val,
+                                                ptr,
+                                                field_info.offset as i32 + src_offset,
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    // For scalar fields, just store the value
+                                    let val = self.translate_expr(field_expr);
+                                    self.builder.ins().store(
+                                        cranelift::prelude::MemFlags::new(),
+                                        val,
+                                        ptr,
+                                        field_info.offset as i32,
+                                    );
+                                }
                             }
                         }
 
@@ -1670,15 +2087,44 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             }
             ExprKind::Field { expr: base, field } => {
                 let ptr = self.translate_expr(base);
-                // Try to find field offset - for now we'll check all known structs
+                // First try to infer the base type and look up in that specific layout
+                if let Some(base_type) = self.infer_type_name(base) {
+                    if let Some(layout) = self.struct_layouts.get(&base_type) {
+                        if let Some(field_info) = layout.fields.get(field) {
+                            // Check if field type is a struct AT ACCESS TIME (not registration time)
+                            // This handles HashMap iteration order issues
+                            let is_struct_field = self.struct_layouts.contains_key(&field_info.type_name);
+                            if is_struct_field {
+                                // For struct-typed fields, return pointer to the nested struct
+                                let offset_val = self.builder.ins().iconst(types::I64, field_info.offset as i64);
+                                return self.builder.ins().iadd(ptr, offset_val);
+                            } else {
+                                // For scalar fields, load the value
+                                return self.builder.ins().load(
+                                    types::I64,
+                                    cranelift::prelude::MemFlags::new(),
+                                    ptr,
+                                    field_info.offset as i32,
+                                );
+                            }
+                        }
+                    }
+                }
+                // Fallback: search all layouts (for cases where type inference fails)
                 for layout in self.struct_layouts.values() {
-                    if let Some(&offset) = layout.fields.get(field) {
-                        return self.builder.ins().load(
-                            types::I64,
-                            cranelift::prelude::MemFlags::new(),
-                            ptr,
-                            offset as i32,
-                        );
+                    if let Some(field_info) = layout.fields.get(field) {
+                        let is_struct_field = self.struct_layouts.contains_key(&field_info.type_name);
+                        if is_struct_field {
+                            let offset_val = self.builder.ins().iconst(types::I64, field_info.offset as i64);
+                            return self.builder.ins().iadd(ptr, offset_val);
+                        } else {
+                            return self.builder.ins().load(
+                                types::I64,
+                                cranelift::prelude::MemFlags::new(),
+                                ptr,
+                                field_info.offset as i32,
+                            );
+                        }
                     }
                 }
                 self.builder.ins().iconst(types::I64, 0)
@@ -1710,13 +2156,84 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                 ptr
             }
             ExprKind::Index { expr: base, index } => {
-                let ptr = self.translate_expr(base);
+                let base_type = self.infer_type_name(base);
                 let idx = self.translate_expr(index);
-                // Calculate offset: idx * 8
-                let eight = self.builder.ins().iconst(types::I64, 8);
-                let offset = self.builder.ins().imul(idx, eight);
-                let addr = self.builder.ins().iadd(ptr, offset);
-                self.builder.ins().load(types::I64, cranelift::prelude::MemFlags::new(), addr, 0)
+
+                // Check if base is a Vec or String (BoltVec layout)
+                let is_vec = base_type.as_ref()
+                    .map(|t| t == "Vec" || t.starts_with("Vec<") || t == "String")
+                    .unwrap_or(false);
+
+                if is_vec {
+                    // Vec/String indexing with bounds check
+                    let vec_ptr = self.translate_expr(base);
+
+                    // Load data pointer (offset 0) and length (offset 8) from Vec struct
+                    let data_ptr = self.builder.ins().load(
+                        types::I64,
+                        cranelift::prelude::MemFlags::new(),
+                        vec_ptr,
+                        0,
+                    );
+                    let len = self.builder.ins().load(
+                        types::I64,
+                        cranelift::prelude::MemFlags::new(),
+                        vec_ptr,
+                        8,
+                    );
+
+                    // Bounds check: if idx >= len, panic
+                    let in_bounds = self.builder.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+
+                    let ok_block = self.builder.create_block();
+                    let panic_block = self.builder.create_block();
+
+                    self.builder.ins().brif(in_bounds, ok_block, &[], panic_block, &[]);
+
+                    // Panic block - call bolt_panic
+                    self.builder.switch_to_block(panic_block);
+                    self.builder.seal_block(panic_block);
+
+                    // Create panic message on stack
+                    let panic_msg = b"index out of bounds";
+                    let msg_len = panic_msg.len();
+                    let msg_slot = self.builder.create_sized_stack_slot(cranelift::prelude::StackSlotData::new(
+                        cranelift::prelude::StackSlotKind::ExplicitSlot,
+                        msg_len as u32,
+                        0,
+                    ));
+                    let msg_ptr = self.builder.ins().stack_addr(types::I64, msg_slot, 0);
+                    for (i, &byte) in panic_msg.iter().enumerate() {
+                        let byte_val = self.builder.ins().iconst(types::I8, byte as i64);
+                        self.builder.ins().store(cranelift::prelude::MemFlags::new(), byte_val, msg_ptr, i as i32);
+                    }
+                    let msg_len_val = self.builder.ins().iconst(types::I64, msg_len as i64);
+
+                    if let Some(&panic_fn) = self.func_names.get("bolt_panic") {
+                        let panic_ref = self.module.declare_func_in_func(panic_fn, self.builder.func);
+                        self.builder.ins().call(panic_ref, &[msg_ptr, msg_len_val]);
+                    }
+                    self.builder.ins().trap(cranelift::prelude::TrapCode::User(0));
+
+                    // OK block - do the actual indexing
+                    self.builder.switch_to_block(ok_block);
+                    self.builder.seal_block(ok_block);
+
+                    // Calculate address: data_ptr + idx * elem_size
+                    let elem_size = self.builder.ins().iconst(types::I64, 8);
+                    let offset = self.builder.ins().imul(idx, elem_size);
+                    let addr = self.builder.ins().iadd(data_ptr, offset);
+
+                    // Load and return the value
+                    self.builder.ins().load(types::I64, cranelift::prelude::MemFlags::new(), addr, 0)
+                } else {
+                    // Raw array/slice indexing (no bounds check, direct pointer arithmetic)
+                    let ptr = self.translate_expr(base);
+                    let eight = self.builder.ins().iconst(types::I64, 8);
+                    let offset = self.builder.ins().imul(idx, eight);
+                    let addr = self.builder.ins().iadd(ptr, offset);
+                    self.builder.ins().load(types::I64, cranelift::prelude::MemFlags::new(), addr, 0)
+                }
             }
             ExprKind::Match { expr: scrutinee, arms } => {
                 let scrutinee_val = self.translate_expr(scrutinee);
@@ -2288,6 +2805,160 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                 }
             }
             BinaryOp::And | BinaryOp::Or => self.builder.ins().band(lhs, rhs),
+        }
+    }
+
+    /// Translate Vec method calls to runtime function calls
+    fn translate_vec_method(&mut self, recv_ptr: Value, method: &str, args: &[Expr]) -> Value {
+        // recv_ptr is a pointer to a BoltVec struct (24 bytes: ptr, len, cap)
+        // Element size is 8 bytes (i64) for now - we'd need type info for proper sizing
+        let elem_size = self.builder.ins().iconst(types::I64, 8);
+
+        match method {
+            "len" => {
+                // Call bolt_vec_len(vec_ptr) -> usize
+                let func_id = self.func_names.get("bolt_vec_len")
+                    .expect("bolt_vec_len not registered");
+                let func_ref = self.module.declare_func_in_func(*func_id, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[recv_ptr]);
+                self.builder.inst_results(call)[0]
+            }
+            "capacity" => {
+                // Call bolt_vec_capacity(vec_ptr) -> usize
+                let func_id = self.func_names.get("bolt_vec_capacity")
+                    .expect("bolt_vec_capacity not registered");
+                let func_ref = self.module.declare_func_in_func(*func_id, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[recv_ptr]);
+                self.builder.inst_results(call)[0]
+            }
+            "is_empty" => {
+                // Call bolt_vec_is_empty(vec_ptr) -> bool
+                let func_id = self.func_names.get("bolt_vec_is_empty")
+                    .expect("bolt_vec_is_empty not registered");
+                let func_ref = self.module.declare_func_in_func(*func_id, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[recv_ptr]);
+                self.builder.inst_results(call)[0]
+            }
+            "push" => {
+                // Call bolt_vec_push(vec_ptr, elem_ptr, elem_size)
+                // First, evaluate the argument and store it on stack to get a pointer
+                if let Some(arg) = args.first() {
+                    let val = self.translate_expr(arg);
+                    // Allocate stack slot for element
+                    let slot = self.builder.create_sized_stack_slot(cranelift::prelude::StackSlotData::new(
+                        cranelift::prelude::StackSlotKind::ExplicitSlot,
+                        8,
+                        0,
+                    ));
+                    let elem_ptr = self.builder.ins().stack_addr(types::I64, slot, 0);
+                    self.builder.ins().store(cranelift::prelude::MemFlags::new(), val, elem_ptr, 0);
+
+                    let func_id = self.func_names.get("bolt_vec_push")
+                        .expect("bolt_vec_push not registered");
+                    let func_ref = self.module.declare_func_in_func(*func_id, self.builder.func);
+                    self.builder.ins().call(func_ref, &[recv_ptr, elem_ptr, elem_size]);
+                }
+                // push returns ()
+                self.builder.ins().iconst(types::I64, 0)
+            }
+            "pop" => {
+                // Call bolt_vec_pop(vec_ptr, elem_size) -> *mut u8
+                let func_id = self.func_names.get("bolt_vec_pop")
+                    .expect("bolt_vec_pop not registered");
+                let func_ref = self.module.declare_func_in_func(*func_id, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[recv_ptr, elem_size]);
+                let result_ptr = self.builder.inst_results(call)[0];
+                // Load the value from the returned pointer (if not null)
+                // For simplicity, just load - caller should handle null check
+                self.builder.ins().load(types::I64, cranelift::prelude::MemFlags::new(), result_ptr, 0)
+            }
+            "clear" => {
+                // Call bolt_vec_clear(vec_ptr)
+                let func_id = self.func_names.get("bolt_vec_clear")
+                    .expect("bolt_vec_clear not registered");
+                let func_ref = self.module.declare_func_in_func(*func_id, self.builder.func);
+                self.builder.ins().call(func_ref, &[recv_ptr]);
+                self.builder.ins().iconst(types::I64, 0)
+            }
+            "get" => {
+                // Call bolt_vec_get(vec_ptr, index, elem_size) -> *const u8
+                if let Some(idx_expr) = args.first() {
+                    let idx = self.translate_expr(idx_expr);
+                    let func_id = self.func_names.get("bolt_vec_get")
+                        .expect("bolt_vec_get not registered");
+                    let func_ref = self.module.declare_func_in_func(*func_id, self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[recv_ptr, idx, elem_size]);
+                    let elem_ptr = self.builder.inst_results(call)[0];
+                    // Load value from pointer
+                    self.builder.ins().load(types::I64, cranelift::prelude::MemFlags::new(), elem_ptr, 0)
+                } else {
+                    self.builder.ins().iconst(types::I64, 0)
+                }
+            }
+            "iter" => {
+                // For now, just return the vec pointer - iterator will be handled by for loop
+                recv_ptr
+            }
+            "sum" => {
+                // Call bolt_vec_sum_i64(vec_ptr) -> i64
+                let func_id = self.func_names.get("bolt_vec_sum_i64")
+                    .expect("bolt_vec_sum_i64 not registered");
+                let func_ref = self.module.declare_func_in_func(*func_id, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[recv_ptr]);
+                self.builder.inst_results(call)[0]
+            }
+            _ => {
+                // Unknown method - return 0
+                self.builder.ins().iconst(types::I64, 0)
+            }
+        }
+    }
+
+    /// Translate String method calls to runtime function calls
+    fn translate_string_method(&mut self, recv_ptr: Value, method: &str, args: &[Expr]) -> Value {
+        match method {
+            "len" => {
+                let func_id = self.func_names.get("bolt_string_len")
+                    .expect("bolt_string_len not registered");
+                let func_ref = self.module.declare_func_in_func(*func_id, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[recv_ptr]);
+                self.builder.inst_results(call)[0]
+            }
+            "as_ptr" => {
+                let func_id = self.func_names.get("bolt_string_as_ptr")
+                    .expect("bolt_string_as_ptr not registered");
+                let func_ref = self.module.declare_func_in_func(*func_id, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[recv_ptr]);
+                self.builder.inst_results(call)[0]
+            }
+            "push" => {
+                // push a char (byte for now)
+                if let Some(arg) = args.first() {
+                    let byte_val = self.translate_expr(arg);
+                    let func_id = self.func_names.get("bolt_string_push_byte")
+                        .expect("bolt_string_push_byte not registered");
+                    let func_ref = self.module.declare_func_in_func(*func_id, self.builder.func);
+                    self.builder.ins().call(func_ref, &[recv_ptr, byte_val]);
+                }
+                self.builder.ins().iconst(types::I64, 0)
+            }
+            "push_str" => {
+                // push_str takes a &str (ptr, len)
+                if let Some(arg) = args.first() {
+                    let str_ptr = self.translate_expr(arg);
+                    // For string literals, we need to extract ptr and len
+                    // For now, assume it's a stack-allocated string
+                    if let ExprKind::Lit(Literal::Str(s)) = &arg.kind {
+                        let len = self.builder.ins().iconst(types::I64, s.len() as i64);
+                        let func_id = self.func_names.get("bolt_string_push_str")
+                            .expect("bolt_string_push_str not registered");
+                        let func_ref = self.module.declare_func_in_func(*func_id, self.builder.func);
+                        self.builder.ins().call(func_ref, &[recv_ptr, str_ptr, len]);
+                    }
+                }
+                self.builder.ins().iconst(types::I64, 0)
+            }
+            _ => self.builder.ins().iconst(types::I64, 0)
         }
     }
 }

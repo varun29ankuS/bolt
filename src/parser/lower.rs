@@ -309,13 +309,12 @@ impl<'a> Lowerer<'a> {
         // Body: return self (since we treat everything as Copy for now)
         let body = Block {
             stmts: Vec::new(),
-            expr: Some(Box::new(Expr {
-                kind: ExprKind::Path(Path {
+            expr: Some(Box::new(Expr::unhashed(
+                ExprKind::Path(Path {
                     segments: vec![PathSegment { ident: "self".to_string(), args: None }],
                 }),
-                ty: None,
-                span: Span::new(self.file_id, 0, 0),
-            })),
+                Span::new(self.file_id, 0, 0),
+            ))),
             span: Span::new(self.file_id, 0, 0),
         };
 
@@ -357,11 +356,10 @@ impl<'a> Lowerer<'a> {
         // Body: call bolt_print_str with type name
         let body = Block {
             stmts: Vec::new(),
-            expr: Some(Box::new(Expr {
-                kind: ExprKind::Lit(Literal::Int(0, None)),  // Placeholder
-                ty: None,
-                span: Span::new(self.file_id, 0, 0),
-            })),
+            expr: Some(Box::new(Expr::unhashed(
+                ExprKind::Lit(Literal::Int(0, None)),  // Placeholder
+                Span::new(self.file_id, 0, 0),
+            ))),
             span: Span::new(self.file_id, 0, 0),
         };
 
@@ -403,11 +401,10 @@ impl<'a> Lowerer<'a> {
             syn::Fields::Named(named) => {
                 named.named.iter().map(|f| {
                     let name = f.ident.as_ref().map(|i| i.to_string()).unwrap_or_default();
-                    let expr = Expr {
-                        kind: ExprKind::Lit(Literal::Int(0, None)),
-                        ty: None,
-                        span: Span::new(self.file_id, 0, 0),
-                    };
+                    let expr = Expr::unhashed(
+                        ExprKind::Lit(Literal::Int(0, None)),
+                        Span::new(self.file_id, 0, 0),
+                    );
                     (name, expr)
                 }).collect()
             }
@@ -416,17 +413,16 @@ impl<'a> Lowerer<'a> {
 
         let body = Block {
             stmts: Vec::new(),
-            expr: Some(Box::new(Expr {
-                kind: ExprKind::Struct {
+            expr: Some(Box::new(Expr::unhashed(
+                ExprKind::Struct {
                     path: Path {
                         segments: vec![PathSegment { ident: type_name.to_string(), args: None }],
                     },
                     fields,
                     rest: None,
                 },
-                ty: None,
-                span: Span::new(self.file_id, 0, 0),
-            })),
+                Span::new(self.file_id, 0, 0),
+            ))),
             span: Span::new(self.file_id, 0, 0),
         };
 
@@ -877,11 +873,10 @@ impl<'a> Lowerer<'a> {
                 }
                 syn::Stmt::Macro(m) => {
                     stmts.push(Stmt {
-                        kind: StmtKind::Expr(Expr {
-                            kind: ExprKind::Err,
-                            ty: None,
-                            span: self.span(m.span()),
-                        }),
+                        kind: StmtKind::Expr(Expr::unhashed(
+                            ExprKind::Err,
+                            self.span(m.span()),
+                        )),
                         span: self.span(m.span()),
                     });
                 }
@@ -950,11 +945,10 @@ impl<'a> Lowerer<'a> {
                     syn::UnOp::Not(_) => UnaryOp::Not,
                     syn::UnOp::Neg(_) => UnaryOp::Neg,
                     syn::UnOp::Deref(_) => {
-                        return Expr {
-                            kind: ExprKind::Deref(Box::new(self.lower_expr(&u.expr))),
-                            ty: None,
+                        return Expr::unhashed(
+                            ExprKind::Deref(Box::new(self.lower_expr(&u.expr))),
                             span,
-                        };
+                        );
                     }
                     _ => UnaryOp::Not,
                 },
@@ -1098,7 +1092,7 @@ impl<'a> Lowerer<'a> {
             _ => ExprKind::Err,
         };
 
-        Expr { kind, ty: None, span }
+        Expr::unhashed(kind, span)
     }
 
     fn lower_lit(&self, lit: &syn::Lit) -> Literal {

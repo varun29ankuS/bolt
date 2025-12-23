@@ -2,6 +2,7 @@
 //!
 //! Performs type inference and checking with proper type resolution.
 
+use crate::cache::ExprCache;
 use crate::error::{Diagnostic, DiagnosticEmitter, Result, Span};
 use crate::hir::*;
 use crate::ty::{Lifetime, LifetimeId, Ty, TyId, TypeRegistry};
@@ -17,6 +18,8 @@ pub struct TypeContext {
     diagnostics: RwLock<DiagnosticEmitter>,
     /// Union-Find structure for type inference unification
     unification: RwLock<HashMap<u32, TyId>>,
+    /// Expression-level incremental compilation cache
+    expr_cache: RwLock<ExprCache>,
 }
 
 impl TypeContext {
@@ -25,7 +28,25 @@ impl TypeContext {
             registry,
             diagnostics: RwLock::new(DiagnosticEmitter::new()),
             unification: RwLock::new(HashMap::new()),
+            expr_cache: RwLock::new(ExprCache::new()),
         }
+    }
+
+    /// Get cached type for an expression by its content hash.
+    pub fn get_cached_type(&self, expr_hash: u64) -> Option<TyId> {
+        self.expr_cache.write().get_type(expr_hash).map(TyId)
+    }
+
+    /// Cache a type checking result for an expression.
+    pub fn cache_type(&self, expr_hash: u64, ty: TyId) {
+        self.expr_cache.write().insert_type(expr_hash, ty.0);
+    }
+
+    /// Get expression cache statistics.
+    pub fn expr_cache_stats(&self) -> (u64, u64, f64) {
+        let cache = self.expr_cache.read();
+        let stats = cache.stats();
+        (stats.type_hits, stats.type_misses, stats.type_hit_rate())
     }
 
     /// Record the type of an expression (delegates to registry)
@@ -226,6 +247,14 @@ impl TypeContext {
             Some(Ty::Infer(var)) => format!("?{}", var),
             Some(Ty::Param { name, .. }) => name,
             Some(Ty::Error) => "<error>".to_string(),
+            // Built-in collection types
+            Some(Ty::Vec(elem)) => format!("Vec<{}>", self.display_type(elem)),
+            Some(Ty::String) => "String".to_string(),
+            Some(Ty::Box(inner)) => format!("Box<{}>", self.display_type(inner)),
+            Some(Ty::Option(inner)) => format!("Option<{}>", self.display_type(inner)),
+            Some(Ty::Result { ok, err }) => {
+                format!("Result<{}, {}>", self.display_type(ok), self.display_type(err))
+            }
             None => "<unknown>".to_string(),
         }
     }
@@ -457,10 +486,54 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn check_expr(&mut self, expr: &Expr) -> Result<TyId> {
+        // Check expression cache for incremental compilation
+        // Only use cache for expressions that don't depend on local context
+        // (literals, some binary ops, etc.) - expressions with paths may
+        // resolve differently in different scopes
+        let can_cache = expr.content_hash != 0 && self.is_cacheable_expr(&expr.kind);
+
+        if can_cache {
+            if let Some(cached_ty) = self.ctx.get_cached_type(expr.content_hash) {
+                // Cache hit - still record for codegen but skip type checking
+                self.ctx.record_expr_type(expr.span, cached_ty);
+                return Ok(cached_ty);
+            }
+        }
+
+        // Cache miss or non-cacheable - perform type checking
         let ty = self.check_expr_inner(expr)?;
+
+        // Cache the result for future use
+        if can_cache {
+            self.ctx.cache_type(expr.content_hash, ty);
+        }
+
         // Record the expression type for codegen to use
         self.ctx.record_expr_type(expr.span, ty);
         Ok(ty)
+    }
+
+    /// Determine if an expression can be safely cached.
+    /// Expressions that depend on local variable resolution cannot be cached
+    /// because the same expression structure may type differently in different scopes.
+    fn is_cacheable_expr(&self, kind: &ExprKind) -> bool {
+        match kind {
+            // Literals are always cacheable
+            ExprKind::Lit(_) => true,
+            // Paths depend on scope - not cacheable
+            ExprKind::Path(_) => false,
+            // Binary/unary ops on cacheable subexpressions
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.is_cacheable_expr(&lhs.kind) && self.is_cacheable_expr(&rhs.kind)
+            }
+            ExprKind::Unary { expr, .. } => self.is_cacheable_expr(&expr.kind),
+            // Tuples/arrays of cacheable expressions
+            ExprKind::Tuple(exprs) | ExprKind::Array(exprs) => {
+                exprs.iter().all(|e| self.is_cacheable_expr(&e.kind))
+            }
+            // Most other expressions involve paths or local state
+            _ => false,
+        }
     }
 
     fn check_expr_inner(&mut self, expr: &Expr) -> Result<TyId> {
@@ -1057,13 +1130,148 @@ impl<'a> TypeChecker<'a> {
         args: &[Expr],
         span: Span,
     ) -> Result<TyId> {
-        // For now, just check the arguments
+        // Try to resolve the method using the method table
+        if let Some(method_info) = self.ctx.registry.resolve_method(receiver_ty, method) {
+            // Look up the function definition to get its signature
+            if let Some(item) = self.krate.items.get(&method_info.def_id) {
+                if let crate::hir::ItemKind::Function(func) = &item.kind {
+                    // Build substitution map for generics if the receiver is generic
+                    let subst = self.build_receiver_subst(receiver_ty);
+
+                    // Resolve the return type
+                    let return_ty = self.ctx.registry.resolve_hir_type_with_subst(&func.sig.output, &subst);
+
+                    // Check argument count (skip first arg which is self)
+                    let expected_args = if func.sig.inputs.first().map(|(n, _)| n.as_str()) == Some("self") {
+                        func.sig.inputs.len() - 1
+                    } else {
+                        func.sig.inputs.len()
+                    };
+
+                    if args.len() != expected_args {
+                        self.ctx.emit_error(
+                            Diagnostic::error(format!(
+                                "Method `{}` expected {} argument(s), got {}",
+                                method, expected_args, args.len()
+                            ))
+                            .with_span(span),
+                        );
+                    }
+
+                    // Check argument types
+                    let param_offset = if func.sig.inputs.first().map(|(n, _)| n.as_str()) == Some("self") { 1 } else { 0 };
+                    for (i, arg) in args.iter().enumerate() {
+                        let arg_ty = self.check_expr(arg)?;
+                        if let Some((_, param_ty)) = func.sig.inputs.get(i + param_offset) {
+                            let expected_ty = self.ctx.registry.resolve_hir_type_with_subst(param_ty, &subst);
+                            if !self.ctx.unify(expected_ty, arg_ty) {
+                                self.ctx.emit_error(
+                                    Diagnostic::error(format!(
+                                        "Method `{}` expected {}, got {}",
+                                        method,
+                                        self.ctx.display_type(expected_ty),
+                                        self.ctx.display_type(arg_ty)
+                                    ))
+                                    .with_span(arg.span),
+                                );
+                            }
+                        }
+                    }
+
+                    return Ok(return_ty);
+                }
+            }
+        }
+
+        // Fallback: check args and infer return type
         for arg in args {
             self.check_expr(arg)?;
         }
 
-        // Method resolution would go here - look up impl blocks
+        // Try built-in method signatures for common types
+        let resolved_ty = self.ctx.resolve(receiver_ty);
+        if let Some(ty) = self.ctx.registry.get(resolved_ty) {
+            match ty {
+                Ty::Vec(elem_ty) => {
+                    match method {
+                        "push" => return Ok(self.ctx.registry.intern(Ty::Unit)),
+                        "pop" => return Ok(self.ctx.registry.intern(Ty::Option(elem_ty))),
+                        "len" | "capacity" => return Ok(self.ctx.registry.intern(Ty::Uint(crate::hir::UintType::Usize))),
+                        "get" => return Ok(self.ctx.registry.intern(Ty::Option(elem_ty))),
+                        "is_empty" => return Ok(self.ctx.registry.intern(Ty::Bool)),
+                        "sum" => return Ok(elem_ty), // Simplified
+                        _ => {}
+                    }
+                }
+                Ty::String => {
+                    match method {
+                        "len" | "capacity" => return Ok(self.ctx.registry.intern(Ty::Uint(crate::hir::UintType::Usize))),
+                        "is_empty" => return Ok(self.ctx.registry.intern(Ty::Bool)),
+                        "as_str" => return Ok(self.ctx.registry.intern(Ty::Str)),
+                        "push" | "push_str" => return Ok(self.ctx.registry.intern(Ty::Unit)),
+                        _ => {}
+                    }
+                }
+                Ty::Option(inner_ty) => {
+                    match method {
+                        "unwrap" | "expect" => return Ok(inner_ty),
+                        "is_some" | "is_none" => return Ok(self.ctx.registry.intern(Ty::Bool)),
+                        "map" | "and_then" => return Ok(self.ctx.registry.fresh_infer()),
+                        _ => {}
+                    }
+                }
+                Ty::Result { ok, .. } => {
+                    match method {
+                        "unwrap" | "expect" => return Ok(ok),
+                        "is_ok" | "is_err" => return Ok(self.ctx.registry.intern(Ty::Bool)),
+                        "ok" => return Ok(self.ctx.registry.intern(Ty::Option(ok))),
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Unknown method - return inference variable
         Ok(self.ctx.registry.fresh_infer())
+    }
+
+    /// Build substitution map from a generic receiver type
+    fn build_receiver_subst(&self, receiver_ty: TyId) -> std::collections::HashMap<String, TyId> {
+        let mut subst = std::collections::HashMap::new();
+
+        if let Some(ty) = self.ctx.registry.get(receiver_ty) {
+            match ty {
+                Ty::Vec(elem) => {
+                    subst.insert("T".to_string(), elem);
+                }
+                Ty::Box(inner) => {
+                    subst.insert("T".to_string(), inner);
+                }
+                Ty::Option(inner) => {
+                    subst.insert("T".to_string(), inner);
+                }
+                Ty::Result { ok, err } => {
+                    subst.insert("T".to_string(), ok);
+                    subst.insert("E".to_string(), err);
+                }
+                Ty::Adt { args, .. } => {
+                    // Generic ADT - assume T, U, V naming convention
+                    for (i, &arg) in args.iter().enumerate() {
+                        let name = match i {
+                            0 => "T",
+                            1 => "U",
+                            2 => "V",
+                            _ => continue,
+                        };
+                        subst.insert(name.to_string(), arg);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        subst
     }
 
     fn check_struct_expr(

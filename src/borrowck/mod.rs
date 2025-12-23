@@ -313,7 +313,9 @@ impl BorrowChecker {
                 self.check_expr(base, ctx, use_kind);
             }
             ExprKind::Index { expr: base, index } => {
-                self.check_expr(base, ctx, use_kind);
+                // Indexing borrows the base container, it doesn't move it
+                // The indexed element might be moved/copied, but the container is only borrowed
+                self.check_expr(base, ctx, UseKind::Read);
                 self.check_expr(index, ctx, UseKind::Read);
             }
             ExprKind::Closure { body, .. } => {

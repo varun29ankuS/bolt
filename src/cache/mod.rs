@@ -240,6 +240,120 @@ impl Default for DependencyTracker {
     }
 }
 
+/// Expression-level incremental compilation cache.
+///
+/// Caches type checking and borrow checking results keyed by expression content hash.
+/// This allows reusing analysis results when expressions haven't changed, even if
+/// their source locations have moved.
+pub struct ExprCache {
+    /// Type checking results: expr_hash -> resolved TyId
+    type_cache: HashMap<u64, u32>,
+    /// Borrow check results: expr_hash -> valid (no borrow errors)
+    borrow_cache: HashMap<u64, bool>,
+    /// Hit/miss statistics
+    stats: ExprCacheStats,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ExprCacheStats {
+    pub type_hits: u64,
+    pub type_misses: u64,
+    pub borrow_hits: u64,
+    pub borrow_misses: u64,
+}
+
+impl ExprCacheStats {
+    pub fn type_hit_rate(&self) -> f64 {
+        let total = self.type_hits + self.type_misses;
+        if total == 0 { 0.0 } else { self.type_hits as f64 / total as f64 }
+    }
+
+    pub fn borrow_hit_rate(&self) -> f64 {
+        let total = self.borrow_hits + self.borrow_misses;
+        if total == 0 { 0.0 } else { self.borrow_hits as f64 / total as f64 }
+    }
+}
+
+impl ExprCache {
+    pub fn new() -> Self {
+        Self {
+            type_cache: HashMap::new(),
+            borrow_cache: HashMap::new(),
+            stats: ExprCacheStats::default(),
+        }
+    }
+
+    /// Look up cached type for an expression by its content hash.
+    pub fn get_type(&mut self, expr_hash: u64) -> Option<u32> {
+        if expr_hash == 0 {
+            return None; // Unhashed expressions can't be cached
+        }
+        if let Some(&ty_id) = self.type_cache.get(&expr_hash) {
+            self.stats.type_hits += 1;
+            Some(ty_id)
+        } else {
+            self.stats.type_misses += 1;
+            None
+        }
+    }
+
+    /// Cache a type checking result.
+    pub fn insert_type(&mut self, expr_hash: u64, ty_id: u32) {
+        if expr_hash != 0 {
+            self.type_cache.insert(expr_hash, ty_id);
+        }
+    }
+
+    /// Look up cached borrow check result.
+    pub fn get_borrow_valid(&mut self, expr_hash: u64) -> Option<bool> {
+        if expr_hash == 0 {
+            return None;
+        }
+        if let Some(&valid) = self.borrow_cache.get(&expr_hash) {
+            self.stats.borrow_hits += 1;
+            Some(valid)
+        } else {
+            self.stats.borrow_misses += 1;
+            None
+        }
+    }
+
+    /// Cache a borrow check result.
+    pub fn insert_borrow_valid(&mut self, expr_hash: u64, valid: bool) {
+        if expr_hash != 0 {
+            self.borrow_cache.insert(expr_hash, valid);
+        }
+    }
+
+    /// Get cache statistics.
+    pub fn stats(&self) -> &ExprCacheStats {
+        &self.stats
+    }
+
+    /// Clear all cached data (useful when source dependencies change).
+    pub fn clear(&mut self) {
+        self.type_cache.clear();
+        self.borrow_cache.clear();
+        self.stats = ExprCacheStats::default();
+    }
+
+    /// Number of cached type entries.
+    pub fn type_cache_size(&self) -> usize {
+        self.type_cache.len()
+    }
+
+    /// Number of cached borrow entries.
+    pub fn borrow_cache_size(&self) -> usize {
+        self.borrow_cache.len()
+    }
+}
+
+impl Default for ExprCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +385,37 @@ mod tests {
         let invalidated = tracker.invalidation_set("c.rs");
         assert!(invalidated.contains(&"c.rs".to_string()));
         assert!(invalidated.contains(&"b.rs".to_string()));
+    }
+
+    #[test]
+    fn test_expr_cache() {
+        let mut cache = ExprCache::new();
+
+        // Test type cache
+        assert_eq!(cache.get_type(12345), None);
+        assert_eq!(cache.stats().type_misses, 1);
+
+        cache.insert_type(12345, 42);
+        assert_eq!(cache.get_type(12345), Some(42));
+        assert_eq!(cache.stats().type_hits, 1);
+
+        // Test borrow cache
+        assert_eq!(cache.get_borrow_valid(67890), None);
+        cache.insert_borrow_valid(67890, true);
+        assert_eq!(cache.get_borrow_valid(67890), Some(true));
+
+        // Test zero hash is ignored
+        cache.insert_type(0, 100);
+        assert_eq!(cache.get_type(0), None);
+
+        // Test statistics
+        assert!(cache.stats().type_hit_rate() > 0.0);
+        assert_eq!(cache.type_cache_size(), 1);
+        assert_eq!(cache.borrow_cache_size(), 1);
+
+        // Test clear
+        cache.clear();
+        assert_eq!(cache.type_cache_size(), 0);
+        assert_eq!(cache.get_type(12345), None);
     }
 }

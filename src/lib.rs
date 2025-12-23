@@ -16,6 +16,7 @@ pub mod cache;
 pub mod cli;
 pub mod error;
 pub mod hir;
+pub mod runtime;
 
 pub use error::{BoltError, Result};
 pub use ty::TypeRegistry;

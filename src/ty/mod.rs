@@ -115,6 +115,28 @@ pub enum Ty {
     },
     /// Error type for recovery
     Error,
+
+    // ===== Built-in collection types =====
+
+    /// Vec<T> - growable array with heap allocation
+    /// Layout: ptr (8) + len (8) + capacity (8) = 24 bytes
+    Vec(TyId),
+
+    /// String - owned UTF-8 string (essentially Vec<u8>)
+    /// Layout: ptr (8) + len (8) + capacity (8) = 24 bytes
+    String,
+
+    /// Box<T> - heap-allocated value
+    /// Layout: ptr (8) = 8 bytes
+    Box(TyId),
+
+    /// Option<T> - optional value
+    /// Layout: discriminant (1) + padding + T
+    Option(TyId),
+
+    /// Result<T, E> - result with error
+    /// Layout: discriminant (1) + padding + max(T, E)
+    Result { ok: TyId, err: TyId },
 }
 
 /// Layout information for a type
@@ -176,6 +198,141 @@ pub struct MonoKey {
     pub type_args: Vec<TyId>,
 }
 
+// ============================================================================
+// Method Resolution System
+// ============================================================================
+
+/// Information about a resolved method
+#[derive(Debug, Clone)]
+pub struct MethodInfo {
+    /// The DefId of the method's function definition
+    pub def_id: DefId,
+    /// The mangled name used in codegen (e.g., "Vec_push")
+    pub mangled_name: String,
+    /// Whether this is a trait method (vs inherent impl)
+    pub is_trait_method: bool,
+    /// The trait this method belongs to (if any)
+    pub trait_name: Option<String>,
+    /// Number of type parameters on the method itself
+    pub method_type_params: usize,
+}
+
+/// Method lookup table for fast resolution
+#[derive(Debug, Default)]
+pub struct MethodTable {
+    /// Inherent methods: (TypeName, MethodName) -> MethodInfo
+    inherent_methods: HashMap<(String, String), MethodInfo>,
+    /// Trait methods: (TraitName, MethodName) -> DefId of trait method
+    trait_methods: HashMap<(String, String), DefId>,
+    /// Which traits each type implements: TypeName -> Vec<TraitName>
+    trait_impls: HashMap<String, Vec<String>>,
+    /// Trait impl methods: (TypeName, TraitName, MethodName) -> MethodInfo
+    trait_impl_methods: HashMap<(String, String, String), MethodInfo>,
+    /// Deref targets: TypeName -> TargetTypeName (for deref coercion)
+    deref_targets: HashMap<String, String>,
+}
+
+impl MethodTable {
+    pub fn new() -> Self {
+        let mut table = Self::default();
+        // Register known deref chains
+        table.deref_targets.insert("String".to_string(), "str".to_string());
+        table.deref_targets.insert("Box".to_string(), "__inner__".to_string()); // placeholder
+        table.deref_targets.insert("Vec".to_string(), "__slice__".to_string()); // placeholder
+        table
+    }
+
+    /// Register an inherent method (impl Type { fn method() })
+    pub fn register_inherent_method(
+        &mut self,
+        type_name: &str,
+        method_name: &str,
+        def_id: DefId,
+        method_type_params: usize,
+    ) {
+        let mangled = format!("{}_{}", type_name, method_name);
+        self.inherent_methods.insert(
+            (type_name.to_string(), method_name.to_string()),
+            MethodInfo {
+                def_id,
+                mangled_name: mangled,
+                is_trait_method: false,
+                trait_name: None,
+                method_type_params,
+            },
+        );
+    }
+
+    /// Register a trait method definition
+    pub fn register_trait_method(&mut self, trait_name: &str, method_name: &str, def_id: DefId) {
+        self.trait_methods.insert(
+            (trait_name.to_string(), method_name.to_string()),
+            def_id,
+        );
+    }
+
+    /// Register that a type implements a trait
+    pub fn register_trait_impl(&mut self, type_name: &str, trait_name: &str) {
+        self.trait_impls
+            .entry(type_name.to_string())
+            .or_default()
+            .push(trait_name.to_string());
+    }
+
+    /// Register a trait impl method (impl Trait for Type { fn method() })
+    pub fn register_trait_impl_method(
+        &mut self,
+        type_name: &str,
+        trait_name: &str,
+        method_name: &str,
+        def_id: DefId,
+    ) {
+        let mangled = format!("{}_{}_{}", type_name, trait_name, method_name);
+        self.trait_impl_methods.insert(
+            (type_name.to_string(), trait_name.to_string(), method_name.to_string()),
+            MethodInfo {
+                def_id,
+                mangled_name: mangled,
+                is_trait_method: true,
+                trait_name: Some(trait_name.to_string()),
+                method_type_params: 0,
+            },
+        );
+    }
+
+    /// Look up an inherent method
+    pub fn get_inherent_method(&self, type_name: &str, method_name: &str) -> Option<&MethodInfo> {
+        self.inherent_methods.get(&(type_name.to_string(), method_name.to_string()))
+    }
+
+    /// Look up a trait impl method
+    pub fn get_trait_impl_method(
+        &self,
+        type_name: &str,
+        trait_name: &str,
+        method_name: &str,
+    ) -> Option<&MethodInfo> {
+        self.trait_impl_methods.get(&(
+            type_name.to_string(),
+            trait_name.to_string(),
+            method_name.to_string(),
+        ))
+    }
+
+    /// Get all traits implemented by a type
+    pub fn get_trait_impls(&self, type_name: &str) -> &[String] {
+        self.trait_impls
+            .get(type_name)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Get deref target for a type
+    pub fn get_deref_target(&self, type_name: &str) -> Option<&str> {
+        self.deref_targets.get(type_name).map(|s| s.as_str())
+    }
+}
+
 /// A lifetime constraint: lhs outlives rhs ('lhs: 'rhs)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LifetimeConstraint {
@@ -221,6 +378,8 @@ pub struct TypeRegistry {
     expr_types: RwLock<HashMap<Span, TyId>>,
     /// Local variable types by (function_name, var_name)
     local_types: RwLock<HashMap<(String, String), TyId>>,
+    /// Method resolution table
+    method_table: RwLock<MethodTable>,
 }
 
 impl TypeRegistry {
@@ -242,6 +401,7 @@ impl TypeRegistry {
             mono_instances: RwLock::new(HashMap::new()),
             expr_types: RwLock::new(HashMap::new()),
             local_types: RwLock::new(HashMap::new()),
+            method_table: RwLock::new(MethodTable::new()),
         };
         // Pre-intern the static lifetime
         registry.intern_lifetime(Lifetime::Static);
@@ -305,6 +465,7 @@ impl TypeRegistry {
 
     /// Initialize the registry from a crate's type definitions
     pub fn init_from_crate(&self, krate: &Crate) {
+        // First pass: register type definitions
         for (def_id, item) in &krate.items {
             match &item.kind {
                 ItemKind::Struct(s) => {
@@ -316,8 +477,130 @@ impl TypeRegistry {
                 ItemKind::TypeAlias(ta) => {
                     self.register_type_alias(&item.name, &ta.generics, &ta.ty);
                 }
+                ItemKind::Trait(t) => {
+                    self.register_trait(&item.name, t, krate);
+                }
                 _ => {}
             }
+        }
+
+        // Second pass: register impl blocks and methods
+        for (def_id, item) in &krate.items {
+            if let ItemKind::Impl(impl_block) = &item.kind {
+                self.register_impl(*def_id, impl_block, krate);
+            }
+        }
+
+        // Third pass: register standalone methods (Type_method pattern)
+        for (def_id, item) in &krate.items {
+            if let ItemKind::Function(f) = &item.kind {
+                // Check for mangled method names like "Vec_push", "String_len"
+                if let Some(underscore_pos) = item.name.find('_') {
+                    let type_name = &item.name[..underscore_pos];
+                    let method_name = &item.name[underscore_pos + 1..];
+
+                    // Only register if this looks like a method (has type prefix)
+                    if self.struct_defs.read().contains_key(type_name)
+                        || self.enum_defs.read().contains_key(type_name)
+                        || ["Vec", "String", "Box", "Option", "Result"].contains(&type_name)
+                    {
+                        let type_params = f.sig.generics.params.iter()
+                            .filter(|p| matches!(p, GenericParam::Type { .. }))
+                            .count();
+                        self.method_table.write().register_inherent_method(
+                            type_name,
+                            method_name,
+                            *def_id,
+                            type_params,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn register_trait(&self, name: &str, t: &hir::Trait, krate: &Crate) {
+        // Register trait method signatures
+        for &method_def_id in &t.items {
+            if let Some(method_item) = krate.items.get(&method_def_id) {
+                if let ItemKind::Function(_) = &method_item.kind {
+                    self.method_table.write().register_trait_method(
+                        name,
+                        &method_item.name,
+                        method_def_id,
+                    );
+                }
+            }
+        }
+    }
+
+    fn register_impl(&self, _def_id: DefId, impl_block: &hir::Impl, krate: &Crate) {
+        // Get the type name this impl is for
+        let type_name = self.extract_type_name(&impl_block.self_ty);
+
+        // Check if this is a trait impl or inherent impl
+        if let Some(trait_ref) = &impl_block.trait_ref {
+            // Trait impl: impl Trait for Type
+            let trait_name = trait_ref.segments.last()
+                .map(|s| s.ident.as_str())
+                .unwrap_or("");
+
+            self.method_table.write().register_trait_impl(&type_name, trait_name);
+
+            // Register each method
+            for &method_def_id in &impl_block.items {
+                if let Some(method_item) = krate.items.get(&method_def_id) {
+                    if let ItemKind::Function(_) = &method_item.kind {
+                        // Extract just the method name (remove type prefix if present)
+                        let method_name = method_item.name
+                            .split('_')
+                            .last()
+                            .unwrap_or(&method_item.name);
+
+                        self.method_table.write().register_trait_impl_method(
+                            &type_name,
+                            trait_name,
+                            method_name,
+                            method_def_id,
+                        );
+                    }
+                }
+            }
+        } else {
+            // Inherent impl: impl Type
+            for &method_def_id in &impl_block.items {
+                if let Some(method_item) = krate.items.get(&method_def_id) {
+                    if let ItemKind::Function(f) = &method_item.kind {
+                        // Extract just the method name
+                        let method_name = method_item.name
+                            .split('_')
+                            .last()
+                            .unwrap_or(&method_item.name);
+
+                        let type_params = f.sig.generics.params.iter()
+                            .filter(|p| matches!(p, GenericParam::Type { .. }))
+                            .count();
+
+                        self.method_table.write().register_inherent_method(
+                            &type_name,
+                            method_name,
+                            method_def_id,
+                            type_params,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn extract_type_name(&self, ty: &HirType) -> String {
+        match &ty.kind {
+            TypeKind::Path(path) => {
+                path.segments.last()
+                    .map(|s| s.ident.clone())
+                    .unwrap_or_else(|| "Unknown".to_string())
+            }
+            _ => "Unknown".to_string(),
         }
     }
 
@@ -513,7 +796,7 @@ impl TypeRegistry {
                 return ty_id;
             }
 
-            // Check for built-in types
+            // Check for built-in primitive types
             match name.as_str() {
                 "bool" => return self.intern(Ty::Bool),
                 "char" => return self.intern(Ty::Char),
@@ -537,6 +820,31 @@ impl TypeRegistry {
 
             // Resolve type arguments if present
             let type_args = self.resolve_generic_args(segment, subst);
+
+            // Check for built-in collection/wrapper types
+            match name.as_str() {
+                "Vec" => {
+                    let elem_ty = type_args.first().copied().unwrap_or_else(|| self.intern(Ty::Error));
+                    return self.intern(Ty::Vec(elem_ty));
+                }
+                "String" => {
+                    return self.intern(Ty::String);
+                }
+                "Box" => {
+                    let inner_ty = type_args.first().copied().unwrap_or_else(|| self.intern(Ty::Error));
+                    return self.intern(Ty::Box(inner_ty));
+                }
+                "Option" => {
+                    let inner_ty = type_args.first().copied().unwrap_or_else(|| self.intern(Ty::Error));
+                    return self.intern(Ty::Option(inner_ty));
+                }
+                "Result" => {
+                    let ok_ty = type_args.first().copied().unwrap_or_else(|| self.intern(Ty::Error));
+                    let err_ty = type_args.get(1).copied().unwrap_or_else(|| self.intern(Ty::Error));
+                    return self.intern(Ty::Result { ok: ok_ty, err: err_ty });
+                }
+                _ => {}
+            }
 
             // Check for struct definition
             if let Some(struct_def) = self.struct_defs.read().get(name).cloned() {
@@ -860,6 +1168,67 @@ impl TypeRegistry {
                     variants: None,
                 }
             }
+
+            // Built-in collection types
+            Some(Ty::Vec(_)) => {
+                // Vec layout: ptr (8) + len (8) + capacity (8) = 24 bytes
+                let mut fields = IndexMap::new();
+                fields.insert("ptr".to_string(), FieldLayout { offset: 0, ty: ty_id });
+                fields.insert("len".to_string(), FieldLayout { offset: 8, ty: ty_id });
+                fields.insert("cap".to_string(), FieldLayout { offset: 16, ty: ty_id });
+                TypeLayout {
+                    size: 24,
+                    align: 8,
+                    fields: Some(fields),
+                    variants: None,
+                }
+            }
+            Some(Ty::String) => {
+                // String layout: same as Vec<u8>
+                let mut fields = IndexMap::new();
+                fields.insert("ptr".to_string(), FieldLayout { offset: 0, ty: ty_id });
+                fields.insert("len".to_string(), FieldLayout { offset: 8, ty: ty_id });
+                fields.insert("cap".to_string(), FieldLayout { offset: 16, ty: ty_id });
+                TypeLayout {
+                    size: 24,
+                    align: 8,
+                    fields: Some(fields),
+                    variants: None,
+                }
+            }
+            Some(Ty::Box(_)) => {
+                // Box layout: just a pointer
+                TypeLayout {
+                    size: 8,
+                    align: 8,
+                    fields: None,
+                    variants: None,
+                }
+            }
+            Some(Ty::Option(inner)) => {
+                // Option layout: discriminant (8 for alignment) + inner
+                let inner_layout = self.layout(inner);
+                let inner_size = inner_layout.size;
+                TypeLayout {
+                    size: 8 + inner_size,
+                    align: 8,
+                    fields: None,
+                    variants: None,
+                }
+            }
+            Some(Ty::Result { ok, err }) => {
+                // Result layout: discriminant (8) + max(ok, err)
+                let ok_layout = self.layout(ok);
+                let err_layout = self.layout(err);
+                let max_size = ok_layout.size.max(err_layout.size);
+                TypeLayout {
+                    size: 8 + max_size,
+                    align: 8,
+                    fields: None,
+                    variants: None,
+                }
+            }
+
             _ => TypeLayout {
                 size: 8,
                 align: 8,
@@ -1032,6 +1401,87 @@ impl TypeRegistry {
     /// Get a local variable's type
     pub fn get_local_type(&self, func: &str, name: &str) -> Option<TyId> {
         self.local_types.read().get(&(func.to_string(), name.to_string())).copied()
+    }
+
+    // ========================================================================
+    // Method Resolution
+    // ========================================================================
+
+    /// Resolve a method call on a receiver type.
+    /// Returns the MethodInfo if found, None otherwise.
+    ///
+    /// Resolution order:
+    /// 1. Inherent methods on the exact type
+    /// 2. Trait impl methods for traits the type implements
+    /// 3. Deref coercion: try the deref target type
+    pub fn resolve_method(&self, receiver_ty: TyId, method_name: &str) -> Option<MethodInfo> {
+        let type_name = self.type_name_for_method_lookup(receiver_ty);
+        self.resolve_method_by_name(&type_name, method_name, 0)
+    }
+
+    /// Resolve method with deref depth limit to prevent infinite loops
+    /// Public for use by codegen to unify method resolution
+    pub fn resolve_method_by_name(&self, type_name: &str, method_name: &str, depth: usize) -> Option<MethodInfo> {
+        // Prevent infinite deref chains
+        if depth > 10 {
+            return None;
+        }
+
+        let table = self.method_table.read();
+
+        // 1. Try inherent methods first
+        if let Some(info) = table.get_inherent_method(type_name, method_name) {
+            return Some(info.clone());
+        }
+
+        // 2. Try trait impl methods
+        for trait_name in table.get_trait_impls(type_name) {
+            if let Some(info) = table.get_trait_impl_method(type_name, trait_name, method_name) {
+                return Some(info.clone());
+            }
+        }
+
+        // 3. Try deref coercion
+        if let Some(deref_target) = table.get_deref_target(type_name) {
+            let target = deref_target.to_string(); // Clone before dropping lock
+            drop(table); // Release lock before recursing
+            return self.resolve_method_by_name(&target, method_name, depth + 1);
+        }
+
+        None
+    }
+
+    /// Get the type name for method resolution
+    fn type_name_for_method_lookup(&self, ty_id: TyId) -> String {
+        match self.get(ty_id) {
+            Some(Ty::Adt { name, .. }) => name,
+            Some(Ty::Vec(_)) => "Vec".to_string(),
+            Some(Ty::String) => "String".to_string(),
+            Some(Ty::Box(_)) => "Box".to_string(),
+            Some(Ty::Option(_)) => "Option".to_string(),
+            Some(Ty::Result { .. }) => "Result".to_string(),
+            Some(Ty::Str) => "str".to_string(),
+            Some(Ty::Slice(_)) => "slice".to_string(),
+            Some(Ty::Ref { inner, .. }) => {
+                // For references, look up methods on the inner type
+                self.type_name_for_method_lookup(inner)
+            }
+            Some(Ty::Ptr { inner, .. }) => {
+                self.type_name_for_method_lookup(inner)
+            }
+            _ => "Unknown".to_string(),
+        }
+    }
+
+    /// Get the mangled method name for codegen
+    pub fn get_method_mangled_name(&self, receiver_ty: TyId, method_name: &str) -> Option<String> {
+        self.resolve_method(receiver_ty, method_name)
+            .map(|info| info.mangled_name)
+    }
+
+    /// Check if a method exists on a type
+    pub fn has_method(&self, receiver_ty: TyId, method_name: &str) -> bool {
+        self.resolve_method(receiver_ty, method_name).is_some()
     }
 }
 
