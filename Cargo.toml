@@ -38,6 +38,10 @@ serde_json = "1.0"
 blake3 = "1.5"  # Fast hashing
 dirs = "5.0"  # Cache directories
 
+# File watching for concurrent compilation
+notify = "6.1"
+notify-debouncer-mini = "0.4"
+
 [profile.release]
 lto = true
 codegen-units = 1

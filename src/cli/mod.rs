@@ -85,6 +85,20 @@ pub enum Commands {
         #[command(subcommand)]
         action: CacheAction,
     },
+
+    /// Watch files and recompile on changes (concurrent compilation)
+    Watch {
+        /// Path to Rust file or directory to watch
+        path: PathBuf,
+
+        /// Output format for errors/diagnostics
+        #[arg(long, short = 'f', value_enum, default_value_t = OutputFormat::Human)]
+        format: OutputFormat,
+
+        /// Run the program after each successful compilation
+        #[arg(long, short)]
+        run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -112,6 +126,9 @@ pub fn run_cli() {
         }
         Commands::Cache { action } => {
             handle_cache(action);
+        }
+        Commands::Watch { path, format, run } => {
+            watch_file(&path, format, run);
         }
     }
 }
@@ -276,6 +293,22 @@ fn run_file(path: &PathBuf, _args: &[String], format: OutputFormat, async_mode: 
     }
 
     if type_ctx.has_errors() {
+        let diagnostics: Vec<JsonDiagnostic> = type_ctx
+            .take_diagnostics()
+            .into_iter()
+            .map(|d| JsonDiagnostic {
+                level: d.level,
+                code: ErrorCode::TypeMismatch,
+                message: d.message,
+                location: None,
+                source_snippet: None,
+                labels: vec![],
+                notes: d.notes,
+                suggestions: vec![],
+                help: None,
+            })
+            .collect();
+        emit_diagnostics(format, diagnostics);
         emit_error_and_exit(format, ErrorCode::TypeMismatch, "Type checking failed", Some(path), None, None);
     }
 
@@ -579,4 +612,218 @@ fn handle_cache(action: CacheAction) {
             }
         }
     }
+}
+
+// ============================================================================
+// Watch Mode - Async Concurrent Compilation
+// ============================================================================
+
+fn watch_file(path: &PathBuf, format: OutputFormat, run_after: bool) {
+    use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+    use std::sync::mpsc::channel;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Duration;
+
+    let path = path.canonicalize().unwrap_or_else(|_| path.clone());
+    let watch_path = if path.is_file() {
+        path.parent().unwrap_or(&path).to_path_buf()
+    } else {
+        path.clone()
+    };
+
+    if matches!(format, OutputFormat::Human) {
+        println!(
+            "{} {} for changes...",
+            "Watching".cyan().bold(),
+            watch_path.display()
+        );
+        println!("  Press Ctrl+C to stop");
+        println!("  Compilation runs in background - system stays responsive\n");
+    }
+
+    // Shared state for async compilation
+    let compile_id = Arc::new(AtomicU64::new(0));
+    let is_compiling = Arc::new(AtomicBool::new(false));
+
+    // Initial compilation (async)
+    spawn_compile(&path, format, run_after, Arc::clone(&compile_id), Arc::clone(&is_compiling));
+
+    // Set up file watcher
+    let (tx, rx) = channel();
+
+    let mut watcher = RecommendedWatcher::new(
+        move |res| {
+            if let Ok(event) = res {
+                let _ = tx.send(event);
+            }
+        },
+        Config::default().with_poll_interval(Duration::from_millis(100)),
+    )
+    .expect("Failed to create file watcher");
+
+    watcher
+        .watch(&watch_path, RecursiveMode::Recursive)
+        .expect("Failed to watch path");
+
+    // Debounce tracking
+    let mut last_event = Instant::now();
+    let debounce_duration = Duration::from_millis(200);
+
+    loop {
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(event) => {
+                // Check if this is a relevant .rs file change
+                let is_rust_file = event
+                    .paths
+                    .iter()
+                    .any(|p| p.extension().map(|e| e == "rs").unwrap_or(false));
+
+                if is_rust_file {
+                    last_event = Instant::now();
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Check if we should trigger a compile (debounced)
+                if last_event.elapsed() > debounce_duration && last_event.elapsed() < debounce_duration + Duration::from_millis(100) {
+                    // Cancel any in-flight compilation by incrementing the ID
+                    compile_id.fetch_add(1, Ordering::SeqCst);
+
+                    if matches!(format, OutputFormat::Human) {
+                        if is_compiling.load(Ordering::SeqCst) {
+                            println!("\n{} Cancelling previous compile...", "⟳".yellow());
+                        }
+                        println!("\n{}", "─".repeat(50).dimmed());
+                        println!("{} Change detected\n", "⟳".cyan().bold());
+                    }
+
+                    spawn_compile(&path, format, run_after, Arc::clone(&compile_id), Arc::clone(&is_compiling));
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break;
+            }
+        }
+    }
+}
+
+fn spawn_compile(
+    path: &PathBuf,
+    format: OutputFormat,
+    run_after: bool,
+    compile_id: Arc<std::sync::atomic::AtomicU64>,
+    is_compiling: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+
+    let path = path.clone();
+    let my_id = compile_id.load(Ordering::SeqCst);
+
+    std::thread::spawn(move || {
+        is_compiling.store(true, Ordering::SeqCst);
+
+        let start = Instant::now();
+
+        // Check if we've been cancelled
+        if compile_id.load(Ordering::SeqCst) != my_id {
+            is_compiling.store(false, Ordering::SeqCst);
+            return;
+        }
+
+        let parser = crate::parser::Parser::new();
+        let krate = match parser.parse_crate(&path) {
+            Ok(k) => k,
+            Err(e) => {
+                if compile_id.load(Ordering::SeqCst) == my_id {
+                    if matches!(format, OutputFormat::Human) {
+                        eprintln!("{} {}", "Parse error:".red().bold(), e);
+                    }
+                }
+                is_compiling.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+
+        // Check cancellation again
+        if compile_id.load(Ordering::SeqCst) != my_id {
+            is_compiling.store(false, Ordering::SeqCst);
+            return;
+        }
+
+        // Type checking
+        let registry = Arc::new(TypeRegistry::new());
+        registry.init_from_crate(&krate);
+        let type_ctx = crate::typeck::TypeContext::new(Arc::clone(&registry));
+        let mut type_checker = crate::typeck::TypeChecker::new(&type_ctx, &krate);
+
+        if let Err(e) = type_checker.check_crate() {
+            if compile_id.load(Ordering::SeqCst) == my_id {
+                if matches!(format, OutputFormat::Human) {
+                    eprintln!("{} {}", "Type error:".red().bold(), e);
+                }
+            }
+            is_compiling.store(false, Ordering::SeqCst);
+            return;
+        }
+
+        if type_ctx.has_errors() {
+            if compile_id.load(Ordering::SeqCst) == my_id {
+                for diag in type_ctx.take_diagnostics() {
+                    if matches!(format, OutputFormat::Human) {
+                        eprintln!("{} {}", "Error:".red().bold(), diag.message);
+                    }
+                }
+            }
+            is_compiling.store(false, Ordering::SeqCst);
+            return;
+        }
+
+        let compile_time = start.elapsed();
+
+        // Final cancellation check before output
+        if compile_id.load(Ordering::SeqCst) != my_id {
+            is_compiling.store(false, Ordering::SeqCst);
+            return;
+        }
+
+        if matches!(format, OutputFormat::Human) {
+            println!(
+                "{} in {:.2}ms",
+                "Compiled".green().bold(),
+                compile_time.as_secs_f64() * 1000.0
+            );
+        }
+
+        if run_after && compile_id.load(Ordering::SeqCst) == my_id {
+            let mut codegen = match crate::codegen::CodeGenerator::new(Arc::clone(&registry)) {
+                Ok(c) => c,
+                Err(e) => {
+                    if matches!(format, OutputFormat::Human) {
+                        eprintln!("{} {}", "Codegen error:".red().bold(), e);
+                    }
+                    is_compiling.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+            codegen.compile_crate(&krate);
+
+            if matches!(format, OutputFormat::Human) {
+                println!("{}", "Running...".dimmed());
+            }
+
+            match codegen.run_main() {
+                Ok(exit_code) => {
+                    if matches!(format, OutputFormat::Human) {
+                        println!("{} with code {}\n", "Finished".green(), exit_code);
+                    }
+                }
+                Err(e) => {
+                    if matches!(format, OutputFormat::Human) {
+                        eprintln!("{} {}", "Runtime error:".red().bold(), e);
+                    }
+                }
+            }
+        }
+
+        is_compiling.store(false, Ordering::SeqCst);
+    });
 }

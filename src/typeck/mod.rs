@@ -77,6 +77,10 @@ impl TypeContext {
         self.diagnostics.read().has_errors()
     }
 
+    pub fn take_diagnostics(&self) -> Vec<Diagnostic> {
+        self.diagnostics.write().take_diagnostics()
+    }
+
     /// Find the representative type for an inference variable
     fn find(&self, ty_id: TyId) -> TyId {
         match self.registry.get(ty_id) {
@@ -293,7 +297,24 @@ impl<'a> TypeChecker<'a> {
     }
 
     pub fn check_crate(&mut self) -> Result<()> {
-        for (_, item) in &self.krate.items {
+        // Collect DefIds that are impl methods - they'll be checked via check_impl
+        let impl_method_ids: std::collections::HashSet<DefId> = self.krate.items
+            .values()
+            .filter_map(|item| {
+                if let ItemKind::Impl(impl_block) = &item.kind {
+                    Some(impl_block.items.iter().copied())
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .collect();
+
+        for (def_id, item) in &self.krate.items {
+            // Skip impl methods - they're checked via check_impl with proper type params
+            if impl_method_ids.contains(def_id) {
+                continue;
+            }
             self.check_item(item)?;
         }
         Ok(())
@@ -315,15 +336,16 @@ impl<'a> TypeChecker<'a> {
 
     fn check_function(&mut self, f: &Function, name: &str) -> Result<()> {
         self.locals.clear();
-        self.type_params.clear();
+        // DON'T clear type_params - preserve impl-level params
         self.current_function = name.to_string();
 
-        // Register type parameters
+        // Register function-level type parameters (may override impl params with same name)
+        let base_index = self.type_params.len();
         for (i, param) in f.sig.generics.params.iter().enumerate() {
             if let GenericParam::Type { name: param_name, .. } = param {
                 let ty_id = self.ctx.registry.intern(Ty::Param {
                     name: param_name.clone(),
-                    index: i,
+                    index: base_index + i,
                 });
                 self.type_params.insert(param_name.clone(), ty_id);
             }
@@ -1026,6 +1048,38 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
             }
+
+            // Check for Type::method (static method / associated function)
+            let method_name = variant_name; // reuse the variable
+            for (_, item) in &self.krate.items {
+                if let ItemKind::Impl(impl_block) = &item.kind {
+                    // Check if impl is for this type
+                    if let TypeKind::Path(impl_path) = &impl_block.self_ty.kind {
+                        if let Some(seg) = impl_path.segments.first() {
+                            if &seg.ident == type_name {
+                                // Found impl for this type, look for the method by DefId
+                                for method_def_id in &impl_block.items {
+                                    if let Some(method_item) = self.krate.items.get(method_def_id) {
+                                        if &method_item.name == method_name {
+                                            if let ItemKind::Function(f) = &method_item.kind {
+                                                // Build the function type
+                                                let inputs: Vec<_> = f
+                                                    .sig
+                                                    .inputs
+                                                    .iter()
+                                                    .map(|(_, ty)| self.resolve_type(ty))
+                                                    .collect();
+                                                let output = self.resolve_type(&f.sig.output);
+                                                return Ok(self.ctx.registry.intern(Ty::Fn { inputs, output }));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Unknown path
@@ -1300,12 +1354,26 @@ impl<'a> TypeChecker<'a> {
             .unwrap_or_default();
 
         if let Some(struct_def) = self.ctx.registry.get_struct(struct_name) {
+            // If no explicit type args, try to infer from type params in scope
+            let effective_type_args: Vec<TyId> = if type_args.is_empty() && !struct_def.generics.params.is_empty() {
+                // Try to use type parameters from current scope
+                struct_def.generics.params.iter().filter_map(|p| {
+                    if let GenericParam::Type { name, .. } = p {
+                        self.type_params.get(name).copied()
+                    } else {
+                        None
+                    }
+                }).collect()
+            } else {
+                type_args
+            };
+
             // Build substitution map
             let mut subst = HashMap::new();
             for (i, param) in struct_def.generics.params.iter().enumerate() {
                 if let GenericParam::Type { name, .. } = param {
-                    if i < type_args.len() {
-                        subst.insert(name.clone(), type_args[i]);
+                    if i < effective_type_args.len() {
+                        subst.insert(name.clone(), effective_type_args[i]);
                     }
                 }
             }
@@ -1337,7 +1405,7 @@ impl<'a> TypeChecker<'a> {
             return Ok(self.ctx.registry.intern(Ty::Adt {
                 def_id: struct_def.def_id,
                 name: struct_name.to_string(),
-                args: type_args,
+                args: effective_type_args,
             }));
         }
 
@@ -1417,7 +1485,28 @@ impl<'a> TypeChecker<'a> {
         Ok(())
     }
 
-    fn check_impl(&mut self, _i: &Impl) -> Result<()> {
+    fn check_impl(&mut self, impl_block: &Impl) -> Result<()> {
+        // Register impl-level type parameters
+        for (i, param) in impl_block.generics.params.iter().enumerate() {
+            if let GenericParam::Type { name: param_name, .. } = param {
+                let ty_id = self.ctx.registry.intern(Ty::Param {
+                    name: param_name.clone(),
+                    index: i,
+                });
+                self.type_params.insert(param_name.clone(), ty_id);
+            }
+        }
+
+        // Check each method in the impl block
+        for method_def_id in &impl_block.items {
+            if let Some(method_item) = self.krate.items.get(method_def_id) {
+                if let ItemKind::Function(f) = &method_item.kind {
+                    self.check_function(f, &method_item.name)?;
+                }
+            }
+        }
+
+        self.type_params.clear();
         Ok(())
     }
 }

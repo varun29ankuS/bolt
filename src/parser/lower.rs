@@ -75,7 +75,7 @@ impl<'a> Lowerer<'a> {
                 krate.items.insert(id, hir_item);
             }
 
-            // Also lower methods from impl blocks
+            // Also lower methods from impl blocks and update impl.items with correct DefIds
             if let syn::Item::Impl(i) = item {
                 let type_name = self.type_name(&i.self_ty);
                 let full_type = if prefix.is_empty() {
@@ -83,10 +83,28 @@ impl<'a> Lowerer<'a> {
                 } else {
                     format!("{}::{}", prefix, type_name)
                 };
+
+                // Collect the actual method DefIds as we lower them
+                let mut method_def_ids = Vec::new();
+                let impl_generics = &i.generics;
                 for impl_item in &i.items {
                     if let syn::ImplItem::Fn(f) = impl_item {
-                        let method = self.lower_impl_fn(f, &full_type);
+                        let method = self.lower_impl_fn(f, &full_type, impl_generics);
+                        method_def_ids.push(method.id);
                         krate.items.insert(method.id, method);
+                    }
+                }
+
+                // Update the impl block's items with the correct DefIds
+                // Find the impl we just inserted and fix its items
+                for (_, hir_item) in krate.items.iter_mut() {
+                    if let ItemKind::Impl(impl_block) = &mut hir_item.kind {
+                        if let TypeKind::Path(p) = &impl_block.self_ty.kind {
+                            if p.segments.first().map(|s| &s.ident) == Some(&type_name) {
+                                impl_block.items = method_def_ids.clone();
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -205,22 +223,46 @@ impl<'a> Lowerer<'a> {
         }
     }
     
-    fn lower_impl_fn(&self, f: &syn::ImplItemFn, type_name: &str) -> Item {
+    fn lower_impl_fn(&self, f: &syn::ImplItemFn, type_name: &str, impl_generics: &syn::Generics) -> Item {
         let id = self.alloc_def_id();
         let method_name = f.sig.ident.to_string();
         let full_name = format!("{}_{}", type_name, method_name);
-        
+
         let mut inputs: Vec<(String, Type)> = Vec::new();
-        
+
+        // Build generic args from impl generics for self type
+        let self_type_args: Option<GenericArgs> = if impl_generics.params.is_empty() {
+            None
+        } else {
+            let args: Vec<GenericArg> = impl_generics.params.iter().filter_map(|p| {
+                match p {
+                    syn::GenericParam::Type(tp) => {
+                        let name = tp.ident.to_string();
+                        Some(GenericArg::Type(Type {
+                            kind: TypeKind::Path(Path {
+                                segments: vec![PathSegment {
+                                    ident: name,
+                                    args: None,
+                                }],
+                            }),
+                            span: Span::dummy(),
+                        }))
+                    }
+                    _ => None,
+                }
+            }).collect();
+            if args.is_empty() { None } else { Some(GenericArgs { args }) }
+        };
+
         for arg in &f.sig.inputs {
             match arg {
-                syn::FnArg::Receiver(r) => {
-                    // self parameter - becomes pointer to struct
+                syn::FnArg::Receiver(_r) => {
+                    // self parameter - becomes pointer to struct with type args
                     inputs.push(("self".to_string(), Type {
                         kind: TypeKind::Path(Path {
                             segments: vec![PathSegment {
                                 ident: type_name.to_string(),
-                                args: None,
+                                args: self_type_args.clone(),
                             }],
                         }),
                         span: Span::dummy(),
