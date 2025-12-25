@@ -137,6 +137,22 @@ pub enum Ty {
     /// Result<T, E> - result with error
     /// Layout: discriminant (1) + padding + max(T, E)
     Result { ok: TyId, err: TyId },
+
+    /// impl Trait - existential type that implements trait bounds
+    /// At monomorphization, this resolves to the concrete type
+    ImplTrait {
+        /// Trait bounds as trait names
+        bounds: Vec<String>,
+        /// The concrete type this resolves to (filled in during inference)
+        concrete: Option<TyId>,
+    },
+
+    /// dyn Trait - trait object (fat pointer)
+    /// Layout: ptr (8) + vtable ptr (8) = 16 bytes
+    DynTrait {
+        /// Trait bounds as trait names
+        bounds: Vec<String>,
+    },
 }
 
 /// Layout information for a type
@@ -777,7 +793,45 @@ impl TypeRegistry {
             }
 
             TypeKind::Path(path) => self.resolve_path_type(path, subst),
+
+            TypeKind::ImplTrait(bounds) => {
+                let trait_names = self.resolve_type_bounds(bounds);
+                self.intern(Ty::ImplTrait {
+                    bounds: trait_names,
+                    concrete: None,
+                })
+            }
+
+            TypeKind::DynTrait(bounds) => {
+                let trait_names = self.resolve_type_bounds(bounds);
+                self.intern(Ty::DynTrait {
+                    bounds: trait_names,
+                })
+            }
         }
+    }
+
+    /// Resolve HIR type bounds to trait names
+    fn resolve_type_bounds(&self, bounds: &[hir::TypeBound]) -> Vec<String> {
+        bounds
+            .iter()
+            .filter_map(|bound| {
+                match bound {
+                    hir::TypeBound::Trait(path) => {
+                        // Convert path to trait name string
+                        if !path.segments.is_empty() {
+                            Some(path.segments.iter()
+                                .map(|s| s.ident.clone())
+                                .collect::<Vec<_>>()
+                                .join("::"))
+                        } else {
+                            None
+                        }
+                    }
+                    hir::TypeBound::Lifetime(_) => None, // Skip lifetime bounds for now
+                }
+            })
+            .collect()
     }
 
     /// Resolve a path type (e.g., `Vec<i32>`, `String`, `MyStruct`)
@@ -1367,6 +1421,12 @@ impl TypeRegistry {
     /// Check if a type is a known enum
     pub fn is_enum(&self, name: &str) -> bool {
         self.enum_defs.read().contains_key(name)
+    }
+
+    /// Check if a type implements a specific trait
+    pub fn type_implements_trait(&self, type_name: &str, trait_name: &str) -> bool {
+        let table = self.method_table.read();
+        table.get_trait_impls(type_name).contains(&trait_name.to_string())
     }
 
     /// Get the size of a type in bytes

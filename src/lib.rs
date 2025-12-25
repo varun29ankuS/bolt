@@ -7,7 +7,9 @@
 //!          parallel   parallel      parallel       parallel
 //! ```
 
+pub mod lexer;
 pub mod parser;
+pub mod parser2;
 pub mod ty;
 pub mod typeck;
 pub mod borrowck;

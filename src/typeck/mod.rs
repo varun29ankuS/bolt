@@ -134,7 +134,33 @@ impl TypeContext {
             (
                 Some(Ty::Ref { inner: a_inner, mutable: a_mut, .. }),
                 Some(Ty::Ref { inner: b_inner, mutable: b_mut, .. }),
-            ) => a_mut == b_mut && self.unify(*a_inner, *b_inner),
+            ) => {
+                // Check for array-to-slice coercion: &[T; N] -> &[T]
+                if a_mut == b_mut {
+                    let inner_a = self.registry.get(*a_inner);
+                    let inner_b = self.registry.get(*b_inner);
+                    match (&inner_a, &inner_b) {
+                        // &[T; N] coerces to &[T]
+                        (Some(Ty::Array { elem: a_elem, .. }), Some(Ty::Slice(b_elem))) => {
+                            return self.unify(*a_elem, *b_elem);
+                        }
+                        // &[T] coerces from &[T; N] (reverse direction)
+                        (Some(Ty::Slice(a_elem)), Some(Ty::Array { elem: b_elem, .. })) => {
+                            return self.unify(*a_elem, *b_elem);
+                        }
+                        // &T coerces to &dyn Trait if T implements Trait
+                        (Some(concrete_ty), Some(Ty::DynTrait { bounds })) => {
+                            return self.check_type_implements_traits(*a_inner, &concrete_ty, bounds);
+                        }
+                        // &dyn Trait accepts &T if T implements Trait (reverse)
+                        (Some(Ty::DynTrait { bounds }), Some(concrete_ty)) => {
+                            return self.check_type_implements_traits(*b_inner, &concrete_ty, bounds);
+                        }
+                        _ => {}
+                    }
+                }
+                a_mut == b_mut && self.unify(*a_inner, *b_inner)
+            }
             // Pointers
             (
                 Some(Ty::Ptr { inner: a_inner, mutable: a_mut }),
@@ -190,8 +216,48 @@ impl TypeContext {
             ) => a_name == b_name && a_idx == b_idx,
             // Type parameter unifies with any type (for now - proper constraint checking later)
             (Some(Ty::Param { .. }), _) | (_, Some(Ty::Param { .. })) => true,
+            // impl Trait unifies with concrete types that implement the trait(s)
+            (Some(Ty::ImplTrait { bounds, .. }), Some(concrete_ty)) => {
+                // Check that concrete type implements all required traits
+                self.check_type_implements_traits(b, &concrete_ty, bounds)
+            }
+            (Some(concrete_ty), Some(Ty::ImplTrait { bounds, .. })) => {
+                // Check that concrete type implements all required traits
+                self.check_type_implements_traits(a, &concrete_ty, bounds)
+            }
+            // dyn Trait types - same trait bounds must match
+            (Some(Ty::DynTrait { bounds: a_bounds }), Some(Ty::DynTrait { bounds: b_bounds })) => {
+                a_bounds == b_bounds
+            }
             _ => false,
         }
+    }
+
+    /// Check if a concrete type implements all the given trait bounds
+    fn check_type_implements_traits(&self, ty_id: TyId, ty: &Ty, bounds: &[String]) -> bool {
+        // Get the type name for trait implementation lookup
+        let type_name = match ty {
+            Ty::Adt { name, .. } => name.clone(),
+            Ty::Int(_) => "i64".to_string(),
+            Ty::Uint(_) => "u64".to_string(),
+            Ty::Float(_) => "f64".to_string(),
+            Ty::Bool => "bool".to_string(),
+            Ty::Char => "char".to_string(),
+            Ty::String => "String".to_string(),
+            Ty::Vec(_) => "Vec".to_string(),
+            Ty::Box(_) => "Box".to_string(),
+            Ty::Option(_) => "Option".to_string(),
+            Ty::Result { .. } => "Result".to_string(),
+            _ => return true, // For unknown types, be permissive for now
+        };
+
+        // Check each required trait bound
+        for trait_name in bounds {
+            if !self.registry.type_implements_trait(&type_name, trait_name) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Get the resolved type, following unification
@@ -221,9 +287,14 @@ impl TypeContext {
             Some(Ty::Float(FloatType::F32)) => "f32".to_string(),
             Some(Ty::Float(FloatType::F64)) => "f64".to_string(),
             Some(Ty::Str) => "str".to_string(),
-            Some(Ty::Ref { inner, mutable, .. }) => {
+            Some(Ty::Ref { inner, mutable, lifetime }) => {
                 let m = if mutable { "mut " } else { "" };
-                format!("&{}{}", m, self.display_type(inner))
+                let lt = self.display_lifetime(lifetime);
+                if lt.is_empty() {
+                    format!("&{}{}", m, self.display_type(inner))
+                } else {
+                    format!("&{} {}{}", lt, m, self.display_type(inner))
+                }
             }
             Some(Ty::Ptr { inner, mutable }) => {
                 let m = if mutable { "mut" } else { "const" };
@@ -259,7 +330,35 @@ impl TypeContext {
             Some(Ty::Result { ok, err }) => {
                 format!("Result<{}, {}>", self.display_type(ok), self.display_type(err))
             }
+            Some(Ty::ImplTrait { bounds, concrete }) => {
+                if let Some(concrete_ty) = concrete {
+                    self.display_type(concrete_ty)
+                } else if bounds.is_empty() {
+                    "impl ?".to_string()
+                } else {
+                    format!("impl {}", bounds.join(" + "))
+                }
+            }
+            Some(Ty::DynTrait { bounds }) => {
+                if bounds.is_empty() {
+                    "dyn ?".to_string()
+                } else {
+                    format!("dyn {}", bounds.join(" + "))
+                }
+            }
             None => "<unknown>".to_string(),
+        }
+    }
+
+    /// Display a lifetime for error messages
+    pub fn display_lifetime(&self, lifetime_id: LifetimeId) -> String {
+        match self.registry.get_lifetime(lifetime_id) {
+            Some(Lifetime::Static) => "'static".to_string(),
+            Some(Lifetime::Named(name)) => format!("'{}", name),
+            Some(Lifetime::Infer(_)) => String::new(), // Hide inference vars
+            Some(Lifetime::Anonymous) => String::new(), // Hide anonymous
+            Some(Lifetime::Bound { .. }) => String::new(), // Hide bound
+            None => String::new(),
         }
     }
 }
@@ -278,6 +377,8 @@ pub struct TypeChecker<'a> {
     locals: IndexMap<String, TyId>,
     /// Generic type parameters in scope
     type_params: HashMap<String, TyId>,
+    /// Lifetime parameters in scope (e.g., 'a, 'b)
+    lifetime_params: HashMap<String, LifetimeId>,
     /// Expected return type of current function
     return_type: Option<TyId>,
     /// Current function name (for recording local types)
@@ -291,6 +392,7 @@ impl<'a> TypeChecker<'a> {
             krate,
             locals: IndexMap::new(),
             type_params: HashMap::new(),
+            lifetime_params: HashMap::new(),
             return_type: None,
             current_function: String::new(),
         }
@@ -331,13 +433,22 @@ impl<'a> TypeChecker<'a> {
             ItemKind::Trait(_) => Ok(()),
             ItemKind::TypeAlias(_) => Ok(()),
             ItemKind::Module(_) => Ok(()),
+            ItemKind::Macro(_) => Ok(()), // Macros are expanded before type checking
         }
     }
 
     fn check_function(&mut self, f: &Function, name: &str) -> Result<()> {
         self.locals.clear();
-        // DON'T clear type_params - preserve impl-level params
+        // DON'T clear type_params or lifetime_params - preserve impl-level params
         self.current_function = name.to_string();
+
+        // Register function-level lifetime parameters
+        for param in f.sig.generics.params.iter() {
+            if let GenericParam::Lifetime { name: lt_name } = param {
+                let lifetime_id = self.ctx.registry.named_lifetime(lt_name);
+                self.lifetime_params.insert(lt_name.clone(), lifetime_id);
+            }
+        }
 
         // Register function-level type parameters (may override impl params with same name)
         let base_index = self.type_params.len();
@@ -381,7 +492,39 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn resolve_type(&self, ty: &Type) -> TyId {
-        self.ctx.registry.resolve_hir_type_with_subst(ty, &self.type_params)
+        self.resolve_type_with_lifetimes(ty, &self.type_params, &self.lifetime_params)
+    }
+
+    /// Resolve a HIR type with both type and lifetime substitutions
+    fn resolve_type_with_lifetimes(
+        &self,
+        ty: &Type,
+        type_subst: &HashMap<String, TyId>,
+        lifetime_subst: &HashMap<String, LifetimeId>,
+    ) -> TyId {
+        match &ty.kind {
+            TypeKind::Ref { lifetime, mutable, inner } => {
+                let inner_id = self.resolve_type_with_lifetimes(inner, type_subst, lifetime_subst);
+                // Resolve lifetime from scope or create fresh
+                let lifetime_id = match lifetime {
+                    Some(name) if name == "static" => self.ctx.registry.static_lifetime(),
+                    Some(name) => {
+                        // Check if lifetime is in scope
+                        lifetime_subst.get(name)
+                            .copied()
+                            .unwrap_or_else(|| self.ctx.registry.named_lifetime(name))
+                    }
+                    None => self.ctx.registry.anonymous_lifetime(),
+                };
+                self.ctx.registry.intern(Ty::Ref {
+                    lifetime: lifetime_id,
+                    mutable: *mutable,
+                    inner: inner_id,
+                })
+            }
+            // For other types, delegate to registry's resolve
+            _ => self.ctx.registry.resolve_hir_type_with_subst(ty, type_subst),
+        }
     }
 
     fn check_block(&mut self, block: &Block) -> Result<TyId> {
@@ -1282,6 +1425,29 @@ impl<'a> TypeChecker<'a> {
                         _ => {}
                     }
                 }
+                Ty::Slice(elem_ty) => {
+                    match method {
+                        "len" => return Ok(self.ctx.registry.intern(Ty::Uint(crate::hir::UintType::Usize))),
+                        "is_empty" => return Ok(self.ctx.registry.intern(Ty::Bool)),
+                        "first" | "last" => return Ok(self.ctx.registry.intern(Ty::Option(elem_ty))),
+                        "get" => return Ok(self.ctx.registry.intern(Ty::Option(elem_ty))),
+                        "iter" => return Ok(self.ctx.registry.fresh_infer()), // Iterator type
+                        _ => {}
+                    }
+                }
+                Ty::Ref { inner, .. } => {
+                    // Check if inner is a slice and delegate
+                    if let Some(Ty::Slice(elem_ty)) = self.ctx.registry.get(inner) {
+                        match method {
+                            "len" => return Ok(self.ctx.registry.intern(Ty::Uint(crate::hir::UintType::Usize))),
+                            "is_empty" => return Ok(self.ctx.registry.intern(Ty::Bool)),
+                            "first" | "last" => return Ok(self.ctx.registry.intern(Ty::Option(elem_ty))),
+                            "get" => return Ok(self.ctx.registry.intern(Ty::Option(elem_ty))),
+                            "iter" => return Ok(self.ctx.registry.fresh_infer()),
+                            _ => {}
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1486,6 +1652,14 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn check_impl(&mut self, impl_block: &Impl) -> Result<()> {
+        // Register impl-level lifetime parameters
+        for param in impl_block.generics.params.iter() {
+            if let GenericParam::Lifetime { name: lt_name } = param {
+                let lifetime_id = self.ctx.registry.named_lifetime(lt_name);
+                self.lifetime_params.insert(lt_name.clone(), lifetime_id);
+            }
+        }
+
         // Register impl-level type parameters
         for (i, param) in impl_block.generics.params.iter().enumerate() {
             if let GenericParam::Type { name: param_name, .. } = param {
@@ -1507,6 +1681,7 @@ impl<'a> TypeChecker<'a> {
         }
 
         self.type_params.clear();
+        self.lifetime_params.clear();
         Ok(())
     }
 }

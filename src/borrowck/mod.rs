@@ -81,11 +81,15 @@ impl BorrowChecker {
 
     fn check_stmt(&self, stmt: &Stmt, ctx: &mut BorrowContext) {
         match &stmt.kind {
-            StmtKind::Let { pattern, init, .. } => {
+            StmtKind::Let { pattern, ty, init } => {
                 if let Some(init) = init {
                     self.check_expr(init, ctx, UseKind::Read);
                 }
-                self.bind_pattern(pattern, ctx);
+                // Extract type name for Copy checking - try annotation first, then infer from init
+                let type_name = ty.as_ref()
+                    .and_then(|t| self.extract_type_name(t))
+                    .or_else(|| init.as_ref().and_then(|e| self.infer_expr_type(e)));
+                self.bind_pattern(pattern, ctx, type_name);
             }
             StmtKind::Expr(expr) | StmtKind::Semi(expr) => {
                 self.check_expr(expr, ctx, UseKind::Read);
@@ -94,24 +98,72 @@ impl BorrowChecker {
         }
     }
 
-    fn bind_pattern(&self, pattern: &Pattern, ctx: &mut BorrowContext) {
+    /// Extract type name from HIR Type for Copy checking
+    fn extract_type_name(&self, ty: &Type) -> Option<String> {
+        match &ty.kind {
+            TypeKind::Path(path) => {
+                if path.segments.len() == 1 {
+                    Some(path.segments[0].ident.clone())
+                } else {
+                    // For paths like std::collections::HashMap, use last segment
+                    path.segments.last().map(|s| s.ident.clone())
+                }
+            }
+            TypeKind::Ref { .. } => Some("&".to_string()),
+            TypeKind::Ptr { .. } => Some("*".to_string()),
+            TypeKind::Unit => Some("()".to_string()),
+            TypeKind::Bool => Some("bool".to_string()),
+            TypeKind::Char => Some("char".to_string()),
+            TypeKind::Int(int_ty) => Some(format!("{:?}", int_ty).to_lowercase()),
+            TypeKind::Uint(uint_ty) => Some(format!("{:?}", uint_ty).to_lowercase()),
+            TypeKind::Float(float_ty) => Some(format!("{:?}", float_ty).to_lowercase()),
+            _ => None,
+        }
+    }
+
+    /// Infer type name from expression for Copy checking
+    fn infer_expr_type(&self, expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            // Literals
+            ExprKind::Lit(lit) => match lit {
+                Literal::Int(_, _) | Literal::Uint(_, _) => Some("i64".to_string()),
+                Literal::Float(_, _) => Some("f64".to_string()),
+                Literal::Bool(_) => Some("bool".to_string()),
+                Literal::Char(_) => Some("char".to_string()),
+                Literal::Str(_) | Literal::ByteStr(_) => Some("String".to_string()),
+            },
+            // References are Copy
+            ExprKind::Ref { .. } => Some("&".to_string()),
+            // Binary ops on numbers return numbers
+            ExprKind::Binary { lhs, .. } => self.infer_expr_type(lhs),
+            // Unary ops preserve type
+            ExprKind::Unary { expr: inner, .. } => self.infer_expr_type(inner),
+            // If expression - infer from then branch
+            ExprKind::If { then_branch, .. } => {
+                then_branch.expr.as_ref().and_then(|e| self.infer_expr_type(e))
+            },
+            _ => None,
+        }
+    }
+
+    fn bind_pattern(&self, pattern: &Pattern, ctx: &mut BorrowContext, type_name: Option<String>) {
         match &pattern.kind {
             PatternKind::Ident { name, mutable, .. } => {
-                ctx.introduce_local(name.clone(), *mutable, pattern.span);
+                ctx.introduce_local(name.clone(), *mutable, pattern.span, type_name);
             }
             PatternKind::Tuple(pats) => {
                 for pat in pats {
-                    self.bind_pattern(pat, ctx);
+                    self.bind_pattern(pat, ctx, None);
                 }
             }
             PatternKind::Struct { fields, .. } => {
                 for field in fields {
-                    self.bind_pattern(&field.pattern, ctx);
+                    self.bind_pattern(&field.pattern, ctx, None);
                 }
             }
             PatternKind::TupleStruct { elems, .. } => {
                 for elem in elems {
-                    self.bind_pattern(elem, ctx);
+                    self.bind_pattern(elem, ctx, None);
                 }
             }
             _ => {}
@@ -156,6 +208,11 @@ impl BorrowChecker {
                         }
                         UseKind::Move => {
                             if let Some(local) = ctx.locals.get_mut(name) {
+                                // Check if type is Copy - Copy types don't need move semantics
+                                let is_copy = local.type_name.as_ref()
+                                    .map(|t| is_copy_type(t))
+                                    .unwrap_or(false);
+
                                 if local.state == PlaceState::Moved {
                                     self.diagnostics.write().emit(
                                         Diagnostic::error(format!(
@@ -164,10 +221,12 @@ impl BorrowChecker {
                                         ))
                                         .with_span(expr.span),
                                     );
-                                } else {
+                                } else if !is_copy {
+                                    // Only mark as moved if not a Copy type
                                     local.state = PlaceState::Moved;
                                     local.moved_span = Some(expr.span);
                                 }
+                                // Copy types just get copied, no state change needed
                             }
                         }
                         UseKind::Borrow => {
@@ -272,7 +331,7 @@ impl BorrowChecker {
             ExprKind::Match { expr: scrutinee, arms } => {
                 self.check_expr(scrutinee, ctx, UseKind::Read);
                 for arm in arms {
-                    self.bind_pattern(&arm.pattern, ctx);
+                    self.bind_pattern(&arm.pattern, ctx, None);
                     if let Some(ref guard) = arm.guard {
                         self.check_expr(guard, ctx, UseKind::Read);
                     }
@@ -288,7 +347,7 @@ impl BorrowChecker {
             }
             ExprKind::For { pattern, iter, body, .. } => {
                 self.check_expr(iter, ctx, UseKind::Move);
-                self.bind_pattern(pattern, ctx);
+                self.bind_pattern(pattern, ctx, None);  // For loop vars type unknown at this level
                 self.check_block(body, ctx);
             }
             ExprKind::Block(block) => {
@@ -310,7 +369,9 @@ impl BorrowChecker {
                 }
             }
             ExprKind::Field { expr: base, .. } => {
-                self.check_expr(base, ctx, use_kind);
+                // Field access doesn't move the base struct - it only reads it
+                // The field value might be moved/copied, but the container is only borrowed
+                self.check_expr(base, ctx, UseKind::Read);
             }
             ExprKind::Index { expr: base, index } => {
                 // Indexing borrows the base container, it doesn't move it
@@ -361,6 +422,21 @@ struct LocalInfo {
     state: PlaceState,
     defined_span: Span,
     moved_span: Option<Span>,
+    type_name: Option<String>,  // Type name for Copy checking
+}
+
+/// Check if a type is Copy (doesn't need move semantics)
+fn is_copy_type(type_name: &str) -> bool {
+    // Primitives
+    matches!(type_name,
+        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" |
+        "u8" | "u16" | "u32" | "u64" | "u128" | "usize" |
+        "f32" | "f64" | "bool" | "char" | "()"
+    ) ||
+    // References are Copy
+    type_name.starts_with("&") ||
+    // Raw pointers are Copy
+    type_name.starts_with("*")
 }
 
 impl BorrowContext {
@@ -385,7 +461,7 @@ impl BorrowContext {
         }
     }
 
-    fn introduce_local(&mut self, name: String, mutable: bool, span: Span) {
+    fn introduce_local(&mut self, name: String, mutable: bool, span: Span, type_name: Option<String>) {
         self.locals.insert(
             name.clone(),
             LocalInfo {
@@ -393,6 +469,7 @@ impl BorrowContext {
                 state: PlaceState::Valid,
                 defined_span: span,
                 moved_span: None,
+                type_name,
             },
         );
         if let Some(scope) = self.scope_stack.last_mut() {

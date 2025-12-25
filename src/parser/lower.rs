@@ -3,17 +3,36 @@
 use crate::error::Span;
 use crate::hir::*;
 use crate::parser::Parser;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use syn::spanned::Spanned;
 
 pub struct Lowerer<'a> {
     parser: &'a Parser,
     file_id: u32,
+    file_path: PathBuf,  // Path to current file for resolving external modules
+    /// Local macro registry for expansion during lowering
+    macros: std::cell::RefCell<std::collections::HashMap<String, MacroDef>>,
 }
 
 impl<'a> Lowerer<'a> {
-    pub fn new(parser: &'a Parser, file_id: u32) -> Self {
-        Self { parser, file_id }
+    pub fn new(parser: &'a Parser, file_id: u32, file_path: PathBuf) -> Self {
+        Self {
+            parser,
+            file_id,
+            file_path,
+            macros: std::cell::RefCell::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Register a macro for expansion
+    fn register_macro(&self, name: String, def: MacroDef) {
+        self.macros.borrow_mut().insert(name, def);
+    }
+
+    /// Look up a macro by name
+    fn lookup_macro(&self, name: &str) -> Option<MacroDef> {
+        self.macros.borrow().get(name).cloned()
     }
 
     /// Extract derive traits from #[derive(...)] attributes
@@ -45,6 +64,46 @@ impl<'a> Lowerer<'a> {
         self.parser.next_def_id.fetch_add(1, Ordering::SeqCst)
     }
 
+    /// Find the file path for an external module declaration
+    /// Tries: parent_dir/mod_name.rs then parent_dir/mod_name/mod.rs
+    fn find_module_file(&self, mod_name: &str) -> Option<PathBuf> {
+        let parent_dir = self.file_path.parent()?;
+
+        // Try mod_name.rs first
+        let file_path = parent_dir.join(format!("{}.rs", mod_name));
+        if file_path.exists() {
+            return Some(file_path);
+        }
+
+        // Try mod_name/mod.rs
+        let dir_path = parent_dir.join(mod_name).join("mod.rs");
+        if dir_path.exists() {
+            return Some(dir_path);
+        }
+
+        None
+    }
+
+    /// Load an external module file and add its items to the crate
+    fn load_external_module(&self, mod_path: &PathBuf, krate: &mut Crate, prefix: &str) {
+        // Read and parse the file
+        let content = match std::fs::read_to_string(mod_path) {
+            Ok(c) => c,
+            Err(_) => return,  // Silently skip if file can't be read
+        };
+
+        let file_id = self.parser.source_map.add_file(mod_path.clone(), content.clone());
+
+        let syn_file = match syn::parse_file(&content) {
+            Ok(f) => f,
+            Err(_) => return,  // Silently skip parse errors
+        };
+
+        // Create a new lowerer for the module file and lower its items
+        let mod_lowerer = Lowerer::new(self.parser, file_id, mod_path.clone());
+        mod_lowerer.lower_items(&syn_file.items, krate, prefix);
+    }
+
     pub fn lower_file(&self, file: &syn::File, krate: &mut Crate) {
         self.lower_items(&file.items, krate, "");
     }
@@ -72,6 +131,10 @@ impl<'a> Lowerer<'a> {
                         krate.entry_point = Some(id);
                     }
                 }
+                // Register macros in the macro registry for quick lookup during expansion
+                if let ItemKind::Macro(ref macro_def) = hir_item.kind {
+                    krate.macros.insert(hir_item.name.clone(), macro_def.clone());
+                }
                 krate.items.insert(id, hir_item);
             }
 
@@ -96,12 +159,25 @@ impl<'a> Lowerer<'a> {
                 }
 
                 // Update the impl block's items with the correct DefIds
+                // Also update self_ty to use full qualified type name for module-qualified types
                 // Find the impl we just inserted and fix its items
                 for (_, hir_item) in krate.items.iter_mut() {
                     if let ItemKind::Impl(impl_block) = &mut hir_item.kind {
                         if let TypeKind::Path(p) = &impl_block.self_ty.kind {
                             if p.segments.first().map(|s| &s.ident) == Some(&type_name) {
                                 impl_block.items = method_def_ids.clone();
+                                // Update self_ty to use full qualified type name
+                                if !prefix.is_empty() {
+                                    impl_block.self_ty = Type {
+                                        kind: TypeKind::Path(Path {
+                                            segments: vec![PathSegment {
+                                                ident: full_type.clone(),
+                                                args: p.segments.first().and_then(|s| s.args.clone()),
+                                            }],
+                                        }),
+                                        span: impl_block.self_ty.span,
+                                    };
+                                }
                                 break;
                             }
                         }
@@ -112,12 +188,26 @@ impl<'a> Lowerer<'a> {
             // Recursively lower inline modules
             if let syn::Item::Mod(m) = item {
                 if let Some((_, content_items)) = &m.content {
+                    // Inline module: mod foo { ... }
                     let mod_prefix = if prefix.is_empty() {
                         m.ident.to_string()
                     } else {
                         format!("{}::{}", prefix, m.ident)
                     };
                     self.lower_items(content_items, krate, &mod_prefix);
+                } else {
+                    // External module: mod foo; - load from foo.rs or foo/mod.rs
+                    let mod_name = m.ident.to_string();
+                    let mod_prefix = if prefix.is_empty() {
+                        mod_name.clone()
+                    } else {
+                        format!("{}::{}", prefix, mod_name)
+                    };
+
+                    // Try to find the module file
+                    if let Some(mod_path) = self.find_module_file(&mod_name) {
+                        self.load_external_module(&mod_path, krate, &mod_prefix);
+                    }
                 }
             }
 
@@ -256,9 +346,9 @@ impl<'a> Lowerer<'a> {
 
         for arg in &f.sig.inputs {
             match arg {
-                syn::FnArg::Receiver(_r) => {
-                    // self parameter - becomes pointer to struct with type args
-                    inputs.push(("self".to_string(), Type {
+                syn::FnArg::Receiver(r) => {
+                    // Build the base struct type
+                    let struct_type = Type {
                         kind: TypeKind::Path(Path {
                             segments: vec![PathSegment {
                                 ident: type_name.to_string(),
@@ -266,7 +356,24 @@ impl<'a> Lowerer<'a> {
                             }],
                         }),
                         span: Span::dummy(),
-                    }));
+                    };
+
+                    // Check if this is &self or &mut self
+                    let self_type = if r.reference.is_some() {
+                        let mutable = r.mutability.is_some();
+                        Type {
+                            kind: TypeKind::Ref {
+                                lifetime: None,
+                                mutable,
+                                inner: Box::new(struct_type),
+                            },
+                            span: Span::dummy(),
+                        }
+                    } else {
+                        struct_type
+                    };
+
+                    inputs.push(("self".to_string(), self_type));
                 }
                 syn::FnArg::Typed(pat_ty) => {
                     let name = if let syn::Pat::Ident(pi) = &*pat_ty.pat {
@@ -348,13 +455,42 @@ impl<'a> Lowerer<'a> {
             generics: Generics::default(),
         };
 
-        // Body: return self (since we treat everything as Copy for now)
+        // Build struct literal with all fields copied from self
+        // Point { x: self.x, y: self.y }
+        let mut fields: Vec<(String, Expr)> = Vec::new();
+        if let syn::Fields::Named(ref named) = s.fields {
+            for field in &named.named {
+                if let Some(ref ident) = field.ident {
+                    let field_name = ident.to_string();
+                    // Create self.field_name expression
+                    let field_access = Expr::unhashed(
+                        ExprKind::Field {
+                            expr: Box::new(Expr::unhashed(
+                                ExprKind::Path(Path {
+                                    segments: vec![PathSegment { ident: "self".to_string(), args: None }],
+                                }),
+                                Span::new(self.file_id, 0, 0),
+                            )),
+                            field: field_name.clone(),
+                        },
+                        Span::new(self.file_id, 0, 0),
+                    );
+                    fields.push((field_name, field_access));
+                }
+            }
+        }
+
+        // Return struct literal: TypeName { fields... }
         let body = Block {
             stmts: Vec::new(),
             expr: Some(Box::new(Expr::unhashed(
-                ExprKind::Path(Path {
-                    segments: vec![PathSegment { ident: "self".to_string(), args: None }],
-                }),
+                ExprKind::Struct {
+                    path: Path {
+                        segments: vec![PathSegment { ident: type_name.to_string(), args: None }],
+                    },
+                    fields,
+                    rest: None,
+                },
                 Span::new(self.file_id, 0, 0),
             ))),
             span: Span::new(self.file_id, 0, 0),
@@ -494,10 +630,530 @@ impl<'a> Lowerer<'a> {
             syn::Item::Trait(t) => Some(self.lower_trait(t)),
             syn::Item::Type(t) => Some(self.lower_type_alias(t)),
             syn::Item::Mod(m) => Some(self.lower_mod(m)),
+            syn::Item::Macro(m) => self.lower_macro(m),
             syn::Item::Use(_) => None,
             syn::Item::ExternCrate(_) => None,
             _ => None,
         }
+    }
+
+    fn lower_macro(&self, m: &syn::ItemMacro) -> Option<Item> {
+        // Only handle macro_rules! definitions
+        let macro_name = m.ident.as_ref()?.to_string();
+
+        // Parse the macro body (TokenStream) into rules
+        let rules = self.parse_macro_rules(&m.mac.tokens)?;
+        let macro_def = MacroDef { rules };
+
+        // Register the macro for expansion during lowering
+        self.register_macro(macro_name.clone(), macro_def.clone());
+
+        let id = self.alloc_def_id();
+        Some(Item {
+            id,
+            name: macro_name,
+            kind: ItemKind::Macro(macro_def),
+            visibility: Visibility::Private, // Macros don't have visibility in syn::ItemMacro
+            span: self.span(m.span()),
+        })
+    }
+
+    fn parse_macro_rules(&self, tokens: &proc_macro2::TokenStream) -> Option<Vec<MacroRule>> {
+        let mut rules = Vec::new();
+        let mut iter = tokens.clone().into_iter().peekable();
+
+        while iter.peek().is_some() {
+            // Each rule: (pattern) => { template }
+            // Skip to opening paren/bracket
+            let pattern_group = match iter.next()? {
+                proc_macro2::TokenTree::Group(g) => g,
+                _ => continue,
+            };
+
+            // Skip =>
+            match iter.next()? {
+                proc_macro2::TokenTree::Punct(p) if p.as_char() == '=' => {}
+                _ => continue,
+            }
+            match iter.next()? {
+                proc_macro2::TokenTree::Punct(p) if p.as_char() == '>' => {}
+                _ => continue,
+            }
+
+            // Get template group
+            let template_group = match iter.next()? {
+                proc_macro2::TokenTree::Group(g) => g,
+                _ => continue,
+            };
+
+            // Skip optional semicolon
+            if let Some(proc_macro2::TokenTree::Punct(p)) = iter.peek() {
+                if p.as_char() == ';' {
+                    iter.next();
+                }
+            }
+
+            let pattern = self.parse_macro_tokens(pattern_group.stream());
+            let template = self.parse_macro_tokens(template_group.stream());
+
+            rules.push(MacroRule { pattern, template });
+        }
+
+        if rules.is_empty() {
+            None
+        } else {
+            Some(rules)
+        }
+    }
+
+    fn parse_macro_tokens(&self, tokens: proc_macro2::TokenStream) -> Vec<MacroToken> {
+        let mut result = Vec::new();
+        let mut iter = tokens.into_iter().peekable();
+
+        while let Some(tt) = iter.next() {
+            match tt {
+                proc_macro2::TokenTree::Ident(ident) => {
+                    result.push(MacroToken::Ident(ident.to_string()));
+                }
+                proc_macro2::TokenTree::Punct(p) => {
+                    let ch = p.as_char();
+                    if ch == '$' {
+                        // Metavariable or repetition - check type first, then consume
+                        let next_is_ident = matches!(iter.peek(), Some(proc_macro2::TokenTree::Ident(_)));
+                        let next_is_group = matches!(iter.peek(), Some(proc_macro2::TokenTree::Group(_)));
+
+                        if next_is_ident {
+                            // Consume the ident
+                            let name = if let Some(proc_macro2::TokenTree::Ident(ident)) = iter.next() {
+                                ident.to_string()
+                            } else {
+                                unreachable!()
+                            };
+
+                            // Check for :kind
+                            let has_colon = matches!(iter.peek(), Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == ':');
+                            if has_colon {
+                                iter.next(); // consume colon
+                                if let Some(proc_macro2::TokenTree::Ident(kind_ident)) = iter.next() {
+                                    let kind = match kind_ident.to_string().as_str() {
+                                        "expr" => MetaVarKind::Expr,
+                                        "ty" => MetaVarKind::Ty,
+                                        "ident" => MetaVarKind::Ident,
+                                        "pat" => MetaVarKind::Pat,
+                                        "stmt" => MetaVarKind::Stmt,
+                                        "block" => MetaVarKind::Block,
+                                        "item" => MetaVarKind::Item,
+                                        "tt" => MetaVarKind::Tt,
+                                        "literal" => MetaVarKind::Literal,
+                                        _ => MetaVarKind::Tt,
+                                    };
+                                    result.push(MacroToken::MetaVar { name, kind });
+                                    continue;
+                                }
+                            }
+                            // Just $name without :kind - treat as ident reference in template
+                            result.push(MacroToken::MetaVar { name, kind: MetaVarKind::Tt });
+                        } else if next_is_group {
+                            // Repetition: $(...)* or $(...)+ or $(...)?
+                            // Consume the group and get its stream
+                            let group_stream = if let Some(proc_macro2::TokenTree::Group(g)) = iter.next() {
+                                g.stream()
+                            } else {
+                                unreachable!()
+                            };
+                            let inner = self.parse_macro_tokens(group_stream);
+
+                            // Check for separator and repetition kind
+                            let mut separator = None;
+                            let mut rep_kind = RepetitionKind::ZeroOrMore;
+
+                            loop {
+                                let peek_char = if let Some(proc_macro2::TokenTree::Punct(p)) = iter.peek() {
+                                    Some(p.as_char())
+                                } else {
+                                    None
+                                };
+
+                                match peek_char {
+                                    Some('*') => {
+                                        rep_kind = RepetitionKind::ZeroOrMore;
+                                        iter.next();
+                                        break;
+                                    }
+                                    Some('+') => {
+                                        rep_kind = RepetitionKind::OneOrMore;
+                                        iter.next();
+                                        break;
+                                    }
+                                    Some('?') => {
+                                        rep_kind = RepetitionKind::ZeroOrOne;
+                                        iter.next();
+                                        break;
+                                    }
+                                    Some(c) => {
+                                        // Separator
+                                        separator = Some(c);
+                                        iter.next();
+                                    }
+                                    None => break,
+                                }
+                            }
+
+                            result.push(MacroToken::Repetition {
+                                tokens: inner,
+                                separator,
+                                kind: rep_kind,
+                            });
+                        } else {
+                            result.push(MacroToken::Punct('$'));
+                        }
+                    } else {
+                        result.push(MacroToken::Punct(ch));
+                    }
+                }
+                proc_macro2::TokenTree::Group(g) => {
+                    let delimiter = match g.delimiter() {
+                        proc_macro2::Delimiter::Parenthesis => Delimiter::Paren,
+                        proc_macro2::Delimiter::Bracket => Delimiter::Bracket,
+                        proc_macro2::Delimiter::Brace => Delimiter::Brace,
+                        proc_macro2::Delimiter::None => Delimiter::Paren,
+                    };
+                    let inner = self.parse_macro_tokens(g.stream());
+                    result.push(MacroToken::Group { delimiter, tokens: inner });
+                }
+                proc_macro2::TokenTree::Literal(lit) => {
+                    result.push(MacroToken::Literal(lit.to_string()));
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Expand a macro invocation
+    fn expand_macro(&self, name: &str, tokens: &proc_macro2::TokenStream, _span: proc_macro2::Span) -> Option<syn::Expr> {
+        // Look up the macro definition
+        let macro_def = self.lookup_macro(name)?;
+
+        // Convert input tokens to our MacroToken representation
+        let input_tokens = self.parse_macro_tokens(tokens.clone());
+
+        // Try each rule in order
+        for rule in &macro_def.rules {
+            if let Some(bindings) = self.match_macro_pattern(&rule.pattern, &input_tokens) {
+                // Expand the template with bindings
+                let expanded_tokens = self.expand_macro_template(&rule.template, &bindings);
+
+                // Convert back to TokenStream and parse as expression
+                let token_stream = self.macro_tokens_to_stream(&expanded_tokens);
+                if let Ok(expr) = syn::parse2::<syn::Expr>(token_stream) {
+                    return Some(expr);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Match input tokens against a macro pattern, returning bindings if matched
+    fn match_macro_pattern(
+        &self,
+        pattern: &[MacroToken],
+        input: &[MacroToken],
+    ) -> Option<std::collections::HashMap<String, Vec<MacroToken>>> {
+        let mut bindings: std::collections::HashMap<String, Vec<MacroToken>> = std::collections::HashMap::new();
+        let mut pattern_idx = 0;
+        let mut input_idx = 0;
+
+        while pattern_idx < pattern.len() {
+            match &pattern[pattern_idx] {
+                MacroToken::MetaVar { name, kind: _ } => {
+                    // Capture the next input token(s) into this metavariable
+                    if input_idx >= input.len() {
+                        return None; // No more input
+                    }
+                    // For simplicity, capture a single token (or group) for now
+                    bindings.insert(name.clone(), vec![input[input_idx].clone()]);
+                    pattern_idx += 1;
+                    input_idx += 1;
+                }
+                MacroToken::Repetition { tokens: rep_pattern, separator, kind } => {
+                    // Handle repetition patterns
+                    let mut rep_bindings: std::collections::HashMap<String, Vec<MacroToken>> = std::collections::HashMap::new();
+
+                    // Collect metavar names in the repetition pattern
+                    for tok in rep_pattern {
+                        if let MacroToken::MetaVar { name, .. } = tok {
+                            rep_bindings.insert(name.clone(), Vec::new());
+                        }
+                    }
+
+                    // Match repeated elements
+                    let mut first = true;
+                    while input_idx < input.len() {
+                        // Check for separator
+                        if !first {
+                            if let Some(sep) = separator {
+                                if let Some(MacroToken::Punct(c)) = input.get(input_idx) {
+                                    if c == sep {
+                                        input_idx += 1;
+                                    } else {
+                                        break; // No separator, end of repetition
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        first = false;
+
+                        // Try to match the repetition pattern
+                        if input_idx >= input.len() {
+                            break;
+                        }
+
+                        // Simple case: single metavar in repetition
+                        if rep_pattern.len() == 1 {
+                            if let MacroToken::MetaVar { name, .. } = &rep_pattern[0] {
+                                rep_bindings.get_mut(name).unwrap().push(input[input_idx].clone());
+                                input_idx += 1;
+                                continue;
+                            }
+                        }
+
+                        // Try to match the pattern
+                        let remaining_input = &input[input_idx..];
+                        if let Some(sub_bindings) = self.match_macro_pattern(rep_pattern, &[remaining_input[0].clone()]) {
+                            for (k, v) in sub_bindings {
+                                rep_bindings.get_mut(&k).map(|vec| vec.extend(v));
+                            }
+                            input_idx += 1;
+                        } else {
+                            break; // Pattern didn't match
+                        }
+                    }
+
+                    // Check kind constraints
+                    let count = rep_bindings.values().next().map(|v| v.len()).unwrap_or(0);
+                    match kind {
+                        RepetitionKind::OneOrMore => {
+                            if count == 0 { return None; }
+                        }
+                        RepetitionKind::ZeroOrOne => {
+                            if count > 1 { return None; }
+                        }
+                        _ => {}
+                    }
+
+                    // Merge repetition bindings
+                    for (k, v) in rep_bindings {
+                        bindings.insert(k, v);
+                    }
+                    pattern_idx += 1;
+                }
+                MacroToken::Ident(expected) => {
+                    if let Some(MacroToken::Ident(actual)) = input.get(input_idx) {
+                        if expected != actual {
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    }
+                    pattern_idx += 1;
+                    input_idx += 1;
+                }
+                MacroToken::Punct(expected) => {
+                    if let Some(MacroToken::Punct(actual)) = input.get(input_idx) {
+                        if expected != actual {
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    }
+                    pattern_idx += 1;
+                    input_idx += 1;
+                }
+                MacroToken::Literal(expected) => {
+                    if let Some(MacroToken::Literal(actual)) = input.get(input_idx) {
+                        if expected != actual {
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    }
+                    pattern_idx += 1;
+                    input_idx += 1;
+                }
+                MacroToken::Group { delimiter, tokens: group_pattern } => {
+                    if let Some(MacroToken::Group { delimiter: input_delim, tokens: input_group }) = input.get(input_idx) {
+                        if delimiter != input_delim {
+                            return None;
+                        }
+                        // Recursively match the group contents
+                        if let Some(sub_bindings) = self.match_macro_pattern(group_pattern, input_group) {
+                            for (k, v) in sub_bindings {
+                                bindings.insert(k, v);
+                            }
+                        } else {
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    }
+                    pattern_idx += 1;
+                    input_idx += 1;
+                }
+            }
+        }
+
+        // All input should be consumed
+        if input_idx == input.len() {
+            Some(bindings)
+        } else {
+            None
+        }
+    }
+
+    /// Expand a macro template with bindings
+    fn expand_macro_template(
+        &self,
+        template: &[MacroToken],
+        bindings: &std::collections::HashMap<String, Vec<MacroToken>>,
+    ) -> Vec<MacroToken> {
+        let mut result = Vec::new();
+
+        for token in template {
+            match token {
+                MacroToken::MetaVar { name, .. } => {
+                    // Substitute the bound value
+                    if let Some(bound) = bindings.get(name) {
+                        if bound.len() == 1 {
+                            result.push(bound[0].clone());
+                        } else {
+                            result.extend(bound.iter().cloned());
+                        }
+                    }
+                }
+                MacroToken::Repetition { tokens: rep_template, separator, .. } => {
+                    // Find the metavar names in the repetition and get their count
+                    let mut metavar_names = Vec::new();
+                    Self::collect_metavar_names(rep_template, &mut metavar_names);
+
+                    let count = metavar_names.first()
+                        .and_then(|n| bindings.get(n))
+                        .map(|v| v.len())
+                        .unwrap_or(0);
+
+                    for i in 0..count {
+                        if i > 0 {
+                            if let Some(sep) = separator {
+                                result.push(MacroToken::Punct(*sep));
+                            }
+                        }
+                        // Expand the repetition template with the i-th element of each binding
+                        let mut index_bindings = std::collections::HashMap::new();
+                        for name in &metavar_names {
+                            if let Some(values) = bindings.get(name) {
+                                if i < values.len() {
+                                    index_bindings.insert(name.clone(), vec![values[i].clone()]);
+                                }
+                            }
+                        }
+                        let expanded = self.expand_macro_template(rep_template, &index_bindings);
+                        result.extend(expanded);
+                    }
+                }
+                MacroToken::Group { delimiter, tokens } => {
+                    let expanded = self.expand_macro_template(tokens, bindings);
+                    result.push(MacroToken::Group {
+                        delimiter: *delimiter,
+                        tokens: expanded,
+                    });
+                }
+                other => {
+                    result.push(other.clone());
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Collect metavar names from a token sequence
+    fn collect_metavar_names(tokens: &[MacroToken], names: &mut Vec<String>) {
+        for token in tokens {
+            match token {
+                MacroToken::MetaVar { name, .. } => {
+                    if !names.contains(name) {
+                        names.push(name.clone());
+                    }
+                }
+                MacroToken::Group { tokens, .. } => {
+                    Self::collect_metavar_names(tokens, names);
+                }
+                MacroToken::Repetition { tokens, .. } => {
+                    Self::collect_metavar_names(tokens, names);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Convert MacroTokens back to a TokenStream
+    fn macro_tokens_to_stream(&self, tokens: &[MacroToken]) -> proc_macro2::TokenStream {
+        let mut stream = proc_macro2::TokenStream::new();
+
+        for token in tokens {
+            match token {
+                MacroToken::Ident(s) => {
+                    let ident = proc_macro2::Ident::new(s, proc_macro2::Span::call_site());
+                    stream.extend(quote::quote!(#ident));
+                }
+                MacroToken::Punct(c) => {
+                    let punct = proc_macro2::Punct::new(*c, proc_macro2::Spacing::Alone);
+                    stream.extend(std::iter::once(proc_macro2::TokenTree::Punct(punct)));
+                }
+                MacroToken::Literal(s) => {
+                    // Parse the literal string back to a token
+                    if let Ok(lit) = syn::parse_str::<proc_macro2::Literal>(s) {
+                        stream.extend(std::iter::once(proc_macro2::TokenTree::Literal(lit)));
+                    } else {
+                        // Try as ident if not a valid literal
+                        let ident = proc_macro2::Ident::new(s, proc_macro2::Span::call_site());
+                        stream.extend(quote::quote!(#ident));
+                    }
+                }
+                MacroToken::MetaVar { name, .. } => {
+                    // This shouldn't happen after expansion, but handle it
+                    let ident = proc_macro2::Ident::new(name, proc_macro2::Span::call_site());
+                    stream.extend(quote::quote!(#ident));
+                }
+                MacroToken::Group { delimiter, tokens } => {
+                    let inner = self.macro_tokens_to_stream(tokens);
+                    let delim = match delimiter {
+                        Delimiter::Paren => proc_macro2::Delimiter::Parenthesis,
+                        Delimiter::Bracket => proc_macro2::Delimiter::Bracket,
+                        Delimiter::Brace => proc_macro2::Delimiter::Brace,
+                    };
+                    let group = proc_macro2::Group::new(delim, inner);
+                    stream.extend(std::iter::once(proc_macro2::TokenTree::Group(group)));
+                }
+                MacroToken::Repetition { tokens, separator, .. } => {
+                    // Already expanded, just emit the tokens
+                    for (i, tok) in tokens.iter().enumerate() {
+                        if i > 0 {
+                            if let Some(sep) = separator {
+                                let punct = proc_macro2::Punct::new(*sep, proc_macro2::Spacing::Alone);
+                                stream.extend(std::iter::once(proc_macro2::TokenTree::Punct(punct)));
+                            }
+                        }
+                        stream.extend(self.macro_tokens_to_stream(&[tok.clone()]));
+                    }
+                }
+            }
+        }
+
+        stream
     }
 
     fn lower_fn(&self, f: &syn::ItemFn) -> Item {
@@ -672,10 +1328,22 @@ impl<'a> Lowerer<'a> {
             .items
             .iter()
             .filter_map(|item| match item {
-                syn::ImplItem::Fn(f) => Some(self.alloc_def_id()),
+                syn::ImplItem::Fn(_f) => Some(self.alloc_def_id()),
                 _ => None,
             })
             .collect();
+
+        // Extract associated type bindings from impl items
+        let mut assoc_types = Vec::new();
+        for item in &i.items {
+            if let syn::ImplItem::Type(type_item) = item {
+                assoc_types.push(AssocTypeBinding {
+                    name: type_item.ident.to_string(),
+                    ty: self.lower_type(&type_item.ty),
+                    span: self.span(type_item.span()),
+                });
+            }
+        }
 
         Item {
             id,
@@ -685,6 +1353,7 @@ impl<'a> Lowerer<'a> {
                 trait_ref,
                 self_ty,
                 items,
+                assoc_types,
             }),
             visibility: Visibility::Private,
             span: self.span(i.span()),
@@ -693,6 +1362,22 @@ impl<'a> Lowerer<'a> {
 
     fn lower_trait(&self, t: &syn::ItemTrait) -> Item {
         let id = self.alloc_def_id();
+
+        // Extract associated types from trait items
+        let mut assoc_types = Vec::new();
+        for item in &t.items {
+            if let syn::TraitItem::Type(type_item) = item {
+                assoc_types.push(AssocTypeDecl {
+                    name: type_item.ident.to_string(),
+                    bounds: type_item.bounds.iter()
+                        .filter_map(|b| self.lower_type_param_bound(b))
+                        .collect(),
+                    default: type_item.default.as_ref().map(|(_, ty)| self.lower_type(ty)),
+                    span: self.span(type_item.span()),
+                });
+            }
+        }
+
         Item {
             id,
             name: t.ident.to_string(),
@@ -700,6 +1385,7 @@ impl<'a> Lowerer<'a> {
                 generics: self.lower_generics(&t.generics),
                 bounds: t.supertraits.iter().filter_map(|b| self.lower_type_param_bound(b)).collect(),
                 items: Vec::new(),
+                assoc_types,
             }),
             visibility: self.lower_visibility(&t.vis),
             span: self.span(t.span()),
@@ -833,6 +1519,18 @@ impl<'a> Lowerer<'a> {
             }
             syn::Type::Never(_) => TypeKind::Never,
             syn::Type::Infer(_) => TypeKind::Infer,
+            syn::Type::ImplTrait(it) => {
+                let bounds = it.bounds.iter()
+                    .filter_map(|b| self.lower_type_param_bound(b))
+                    .collect();
+                TypeKind::ImplTrait(bounds)
+            }
+            syn::Type::TraitObject(to) => {
+                let bounds = to.bounds.iter()
+                    .filter_map(|b| self.lower_type_param_bound(b))
+                    .collect();
+                TypeKind::DynTrait(bounds)
+            }
             _ => TypeKind::Error,
         };
 
@@ -968,6 +1666,11 @@ impl<'a> Lowerer<'a> {
                 mutable: r.mutability.is_some(),
                 pattern: Box::new(self.lower_pattern(&r.pat)),
             },
+            syn::Pat::Type(pt) => {
+                // Handle typed patterns like `x: i32` in closures
+                // Extract the inner pattern (the variable name)
+                return self.lower_pattern(&pt.pat);
+            }
             _ => PatternKind::Wild,
         };
 
@@ -1130,7 +1833,19 @@ impl<'a> Lowerer<'a> {
                 hi: r.end.as_ref().map(|e| Box::new(self.lower_expr(e))),
                 inclusive: matches!(r.limits, syn::RangeLimits::Closed(_)),
             },
-            syn::Expr::Macro(_) => ExprKind::Err,
+            syn::Expr::Macro(m) => {
+                // Extract macro name
+                let macro_name = m.mac.path.segments.last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+
+                // Try to expand the macro
+                if let Some(expanded) = self.expand_macro(&macro_name, &m.mac.tokens, expr.span()) {
+                    return self.lower_expr(&expanded);
+                }
+                // Fallback: couldn't expand
+                ExprKind::Err
+            }
             _ => ExprKind::Err,
         };
 

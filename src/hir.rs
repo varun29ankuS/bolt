@@ -21,6 +21,8 @@ pub struct Crate {
     pub entry_point: Option<DefId>,
     /// Import aliases: short_name -> full_path (e.g., "add" -> "math::add")
     pub imports: std::collections::HashMap<String, String>,
+    /// Macro definitions: name -> definition
+    pub macros: std::collections::HashMap<String, MacroDef>,
 }
 
 impl Crate {
@@ -30,6 +32,7 @@ impl Crate {
             items: IndexMap::new(),
             entry_point: None,
             imports: std::collections::HashMap::new(),
+            macros: std::collections::HashMap::new(),
         }
     }
 }
@@ -54,6 +57,73 @@ pub enum ItemKind {
     Trait(Trait),
     TypeAlias(TypeAlias),
     Module(Module),
+    Macro(MacroDef),
+}
+
+/// A macro_rules! definition
+#[derive(Debug, Clone)]
+pub struct MacroDef {
+    pub rules: Vec<MacroRule>,
+}
+
+/// A single rule in a macro_rules! definition
+#[derive(Debug, Clone)]
+pub struct MacroRule {
+    /// The pattern to match (as token trees)
+    pub pattern: Vec<MacroToken>,
+    /// The expansion template (as token trees)
+    pub template: Vec<MacroToken>,
+}
+
+/// Token in a macro pattern or template
+#[derive(Debug, Clone)]
+pub enum MacroToken {
+    /// Literal identifier
+    Ident(String),
+    /// Literal punctuation
+    Punct(char),
+    /// Metavariable: $name:kind
+    MetaVar { name: String, kind: MetaVarKind },
+    /// Repetition: $(...)*  or  $(...)+ or  $(...),*
+    Repetition {
+        tokens: Vec<MacroToken>,
+        separator: Option<char>,
+        kind: RepetitionKind,
+    },
+    /// Grouped tokens: (...) or [...] or {...}
+    Group {
+        delimiter: Delimiter,
+        tokens: Vec<MacroToken>,
+    },
+    /// Literal token (number, string, etc)
+    Literal(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetaVarKind {
+    Expr,   // $x:expr
+    Ty,     // $t:ty
+    Ident,  // $i:ident
+    Pat,    // $p:pat
+    Stmt,   // $s:stmt
+    Block,  // $b:block
+    Item,   // $i:item
+    Tt,     // $t:tt (token tree)
+    Literal, // $l:literal
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepetitionKind {
+    ZeroOrMore,  // *
+    OneOrMore,   // +
+    ZeroOrOne,   // ?
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delimiter {
+    Paren,   // ()
+    Bracket, // []
+    Brace,   // {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +200,10 @@ pub enum TypeKind {
     Never,
     Infer,
     Error,
+    /// impl Trait - existential type that implements a trait
+    ImplTrait(Vec<TypeBound>),
+    /// dyn Trait - trait object
+    DynTrait(Vec<TypeBound>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -222,6 +296,16 @@ pub struct Impl {
     pub trait_ref: Option<Path>,
     pub self_ty: Type,
     pub items: Vec<DefId>,
+    /// Associated type bindings: type Item = ConcreteType;
+    pub assoc_types: Vec<AssocTypeBinding>,
+}
+
+/// An associated type binding in an impl block
+#[derive(Debug, Clone)]
+pub struct AssocTypeBinding {
+    pub name: String,
+    pub ty: Type,
+    pub span: Span,
 }
 
 #[derive(Debug)]
@@ -229,6 +313,17 @@ pub struct Trait {
     pub generics: Generics,
     pub bounds: Vec<TypeBound>,
     pub items: Vec<DefId>,
+    /// Associated types declared in this trait
+    pub assoc_types: Vec<AssocTypeDecl>,
+}
+
+/// An associated type declaration in a trait
+#[derive(Debug, Clone)]
+pub struct AssocTypeDecl {
+    pub name: String,
+    pub bounds: Vec<TypeBound>,
+    pub default: Option<Type>,
+    pub span: Span,
 }
 
 #[derive(Debug)]
@@ -676,6 +771,25 @@ fn hash_type<H: Hasher>(kind: &TypeKind, hasher: &mut H) {
                 hash_type(&i.kind, hasher);
             }
             hash_type(&output.kind, hasher);
+        }
+        TypeKind::ImplTrait(bounds) | TypeKind::DynTrait(bounds) => {
+            bounds.len().hash(hasher);
+            for bound in bounds {
+                hash_type_bound(bound, hasher);
+            }
+        }
+    }
+}
+
+fn hash_type_bound<H: Hasher>(bound: &TypeBound, hasher: &mut H) {
+    match bound {
+        TypeBound::Trait(path) => {
+            0u8.hash(hasher);
+            hash_path(path, hasher);
+        }
+        TypeBound::Lifetime(lt) => {
+            1u8.hash(hasher);
+            lt.hash(hasher);
         }
     }
 }

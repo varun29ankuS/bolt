@@ -157,7 +157,7 @@ impl Parser {
             message: e.to_string(),
         })?;
 
-        let lowerer = lower::Lowerer::new(self, file_id);
+        let lowerer = lower::Lowerer::new(self, file_id, path.to_path_buf());
         lowerer.lower_file(&syn_file, krate);
 
         Ok(())
