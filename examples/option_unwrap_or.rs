@@ -4,13 +4,6 @@ enum Option<T> {
 }
 
 impl<T> Option<T> {
-    fn unwrap(self) -> T {
-        match self {
-            Option::Some(val) => val,
-            Option::None => 0,  // Simplified - no panic yet
-        }
-    }
-    
     fn unwrap_or(self, default: T) -> T {
         match self {
             Option::Some(val) => val,
@@ -21,7 +14,7 @@ impl<T> Option<T> {
 
 fn main() {
     let x: Option<i32> = Option::Some(42);
-    print(x.unwrap());  // Should print 42
+    print(x.unwrap_or(100));  // Should print 42
     
     let y: Option<i32> = Option::None;
     print(y.unwrap_or(99));  // Should print 99

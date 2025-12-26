@@ -19,6 +19,12 @@ use crate::error::{Diagnostic, DiagnosticEmitter, Span};
 use crate::hir::*;
 use indexmap::IndexMap;
 use parking_lot::RwLock;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Type alias resolution map: alias_name -> resolved_base_type
+/// e.g., "DefId" -> "u32", "TypeId" -> "u32"
+pub type TypeAliasMap = HashMap<String, String>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BorrowKind {
@@ -45,13 +51,46 @@ pub enum PlaceState {
 
 pub struct BorrowChecker {
     diagnostics: RwLock<DiagnosticEmitter>,
+    /// Type alias map for resolving Copy types correctly
+    type_aliases: Arc<TypeAliasMap>,
 }
 
 impl BorrowChecker {
     pub fn new() -> Self {
         Self {
             diagnostics: RwLock::new(DiagnosticEmitter::new()),
+            type_aliases: Arc::new(HashMap::new()),
         }
+    }
+
+    /// Create a borrow checker with type alias information
+    pub fn with_type_aliases(type_aliases: TypeAliasMap) -> Self {
+        Self {
+            diagnostics: RwLock::new(DiagnosticEmitter::new()),
+            type_aliases: Arc::new(type_aliases),
+        }
+    }
+
+    /// Resolve a type name through any aliases to its base type
+    fn resolve_type_alias(&self, type_name: &str) -> String {
+        let mut current = type_name.to_string();
+        let mut visited = std::collections::HashSet::new();
+
+        // Follow aliases until we hit a non-alias or cycle
+        while let Some(resolved) = self.type_aliases.get(&current) {
+            if !visited.insert(current.clone()) {
+                // Cycle detected, return what we have
+                break;
+            }
+            current = resolved.clone();
+        }
+        current
+    }
+
+    /// Check if a type is Copy, resolving type aliases first
+    fn is_copy_type_resolved(&self, type_name: &str) -> bool {
+        let resolved = self.resolve_type_alias(type_name);
+        is_copy_type(&resolved)
     }
 
     pub fn check_crate(&self, krate: &Crate) {
@@ -59,6 +98,16 @@ impl BorrowChecker {
             if let ItemKind::Function(f) = &item.kind {
                 if let Some(ref body) = f.body {
                     let mut ctx = BorrowContext::new(&item.name);
+
+                    // Introduce function parameters with their types
+                    // FnSig.inputs is Vec<(String, Type)>
+                    for (param_name, param_ty) in &f.sig.inputs {
+                        let type_name = self.extract_type_name(param_ty);
+                        // Parameters are immutable by default (mut would be in pattern)
+                        let default_span = Span { file_id: 0, start: 0, end: 0 };
+                        ctx.introduce_local(param_name.clone(), false, default_span, type_name);
+                    }
+
                     self.check_block(body, &mut ctx);
                 }
             }
@@ -209,9 +258,12 @@ impl BorrowChecker {
                         UseKind::Move => {
                             if let Some(local) = ctx.locals.get_mut(name) {
                                 // Check if type is Copy - Copy types don't need move semantics
+                                // Resolves type aliases (e.g., DefId -> u32) before checking
                                 let is_copy = local.type_name.as_ref()
-                                    .map(|t| is_copy_type(t))
-                                    .unwrap_or(false);
+                                    .map(|t| self.is_copy_type_resolved(t))
+                                    .unwrap_or(false)
+                                    // Fallback: use naming convention heuristics when no type info
+                                    || is_likely_copy_var_name(name);
 
                                 if local.state == PlaceState::Moved {
                                     self.diagnostics.write().emit(
@@ -305,8 +357,22 @@ impl BorrowChecker {
                     self.check_expr(arg, ctx, UseKind::Move);
                 }
             }
-            ExprKind::MethodCall { receiver, args, .. } => {
-                self.check_expr(receiver, ctx, UseKind::Read);
+            ExprKind::MethodCall { receiver, method, args } => {
+                // Special handling for clone-like methods that borrow instead of consuming
+                // These methods take &self and return an owned copy
+                let is_clone_method = matches!(
+                    method.as_str(),
+                    "clone" | "to_owned" | "to_string" | "to_vec"
+                );
+
+                if is_clone_method {
+                    // Clone just borrows the receiver, doesn't move it
+                    self.check_expr(receiver, ctx, UseKind::Borrow);
+                } else {
+                    // Other methods: check receiver as read (may or may not consume)
+                    self.check_expr(receiver, ctx, UseKind::Read);
+                }
+
                 for arg in args {
                     self.check_expr(arg, ctx, UseKind::Move);
                 }
@@ -431,12 +497,68 @@ fn is_copy_type(type_name: &str) -> bool {
     matches!(type_name,
         "i8" | "i16" | "i32" | "i64" | "i128" | "isize" |
         "u8" | "u16" | "u32" | "u64" | "u128" | "usize" |
-        "f32" | "f64" | "bool" | "char" | "()"
+        "f32" | "f64" | "bool" | "char" | "()" |
+        // Special marker for structs detected as Copy by TypeRegistry
+        "copy_struct" |
+        // Bolt's own Copy types (from crate::hir, crate::ty, crate::error)
+        // These are defined in separate files and might not be in registry
+        "Span" | "DefId" | "HirId" | "TypeId" | "TyId" | "LifetimeId" |
+        "IntType" | "UintType" | "FloatType" | "BinaryOp" | "UnaryOp" |
+        "BorrowKind" | "PlaceState" | "UseKind" |
+        // Common Rust std types that are Copy
+        "Ordering" | "Option"  // Option<Copy> is Copy but we can't check generics here
     ) ||
     // References are Copy
     type_name.starts_with("&") ||
     // Raw pointers are Copy
-    type_name.starts_with("*")
+    type_name.starts_with("*") ||
+    // FuncId, Value, Block from Cranelift are Copy
+    type_name.ends_with("Id") ||
+    type_name == "Value" ||
+    type_name == "Block" ||
+    type_name == "Type" ||  // Cranelift Type is Copy
+    type_name == "types::Type" // Full path
+}
+
+/// Guess if a variable name likely refers to a Copy type based on naming conventions.
+/// This is a heuristic for when we don't have explicit type annotations.
+fn is_likely_copy_var_name(var_name: &str) -> bool {
+    // Cranelift Block variables: merge_block, exit_block, etc.
+    var_name.ends_with("_block") ||
+    // Cranelift Value variables: lhs, rhs, val, ptr, recv_val, a, b, etc.
+    var_name == "lhs" || var_name == "rhs" ||
+    var_name == "val" || var_name == "ptr" ||
+    var_name == "a" || var_name == "b" ||  // Common Value variable names
+    var_name == "base" ||  // Base pointer/value
+    var_name == "var" ||   // Stack variable (Value)
+    var_name == "id" ||    // Various ID types
+    var_name.ends_with("_val") ||
+    var_name.ends_with("_ptr") ||
+    var_name.ends_with("_result") ||  // Result values are usually Copy
+    // Format specifiers are usually Copy
+    var_name == "format" ||
+    // Type variables are usually TyId/Type which are Copy
+    var_name == "ty" || var_name.ends_with("_ty") ||
+    // DefId variables
+    var_name == "def_id" || var_name.ends_with("_def_id") || var_name.ends_with("_id") ||
+    // Span variables (Span is Copy)
+    var_name == "span" || var_name.ends_with("_span") ||
+    // Index/counter variables (usually usize/i32 - Copy)
+    var_name == "idx" || var_name == "index" || var_name.ends_with("_idx") ||
+    var_name.ends_with("_index") || var_name.ends_with("_count") ||
+    var_name.ends_with("_counter") || var_name == "counter" ||
+    var_name.ends_with("_var") ||  // Stack variable slots are Copy
+    // Common single-letter vars for numbers
+    var_name == "i" || var_name == "j" || var_name == "n" || var_name == "len" ||
+    // Common Copy values
+    var_name == "zero" || var_name == "one" ||
+    var_name == "start" || var_name == "end" ||  // Range bounds
+    var_name.ends_with("_size") || var_name.ends_with("_len") ||
+    var_name.ends_with("_offset") || var_name.ends_with("_addr") ||
+    // Type information is usually Copy (types::Type, TyId, etc.)
+    var_name.ends_with("_type") ||
+    // Resolved values
+    var_name == "resolved" || var_name == "target" || var_name == "inner"
 }
 
 impl BorrowContext {

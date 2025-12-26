@@ -5,7 +5,7 @@
 //!
 //! State is persisted to disk so blocking works across CLI invocations.
 
-use super::BorrowChecker;
+use super::{BorrowChecker, TypeAliasMap};
 use crate::error::Diagnostic;
 use crate::hir::Crate;
 use parking_lot::RwLock;
@@ -158,6 +158,11 @@ impl AsyncBorrowChecker {
     /// Returns immediately - check result will be available later.
     /// Clears any persisted failure state since we're recompiling.
     pub fn spawn_check(&self, path: PathBuf, krate: Arc<Crate>) {
+        // Default to empty type aliases for backwards compatibility
+        self.spawn_check_with_aliases(path, krate, TypeAliasMap::new());
+    }
+
+    pub fn spawn_check_with_aliases(&self, path: PathBuf, krate: Arc<Crate>, type_aliases: TypeAliasMap) {
         let canonical = canonical_path(&path);
 
         // Clear persisted failure since we're recompiling
@@ -167,7 +172,7 @@ impl AsyncBorrowChecker {
         let canonical_for_persist = canonical.clone();
 
         let handle = thread::spawn(move || {
-            let checker = BorrowChecker::new();
+            let checker = BorrowChecker::with_type_aliases(type_aliases);
             checker.check_crate(&krate);
             let diagnostics = checker.take_diagnostics();
 

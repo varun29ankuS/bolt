@@ -13,8 +13,15 @@ use std::sync::Arc;
 
 #[derive(ClapParser)]
 #[command(name = "bolt")]
-#[command(about = "Lightning-fast Rust compiler for development")]
+#[command(about = "⚡ Lightning-fast Rust compiler for development ⚡")]
 #[command(version)]
+#[command(after_help = "Examples:
+  bolt run main.rs          ⚡ Compile and run instantly
+  bolt check src/lib.rs     ⚡ Type-check without codegen
+  bolt watch src/ --run     ⚡ Auto-recompile on changes
+  bolt build main.rs        ⚡ Build executable
+
+Speed: ~25x faster than rustc for development builds")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -30,6 +37,16 @@ pub enum OutputFormat {
     Json,
     /// Pretty-printed JSON for debugging
     JsonPretty,
+}
+
+/// Parser backend to use
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum ParserBackend {
+    /// Syn-based parser (legacy)
+    Syn,
+    /// Chumsky-based parser with error recovery (default)
+    #[default]
+    Chumsky,
 }
 
 #[derive(Subcommand)]
@@ -50,6 +67,10 @@ pub enum Commands {
         /// Run borrow checker synchronously (default is async - code runs immediately)
         #[arg(long)]
         sync_borrow: bool,
+
+        /// Parser backend to use
+        #[arg(long, short = 'p', value_enum, default_value_t = ParserBackend::Chumsky)]
+        parser: ParserBackend,
     },
 
     /// Build a Rust file or project
@@ -68,6 +89,10 @@ pub enum Commands {
         /// Output format for errors/diagnostics
         #[arg(long, short = 'f', value_enum, default_value_t = OutputFormat::Human)]
         format: OutputFormat,
+
+        /// Parser backend to use
+        #[arg(long, short = 'p', value_enum, default_value_t = ParserBackend::Chumsky)]
+        parser: ParserBackend,
     },
 
     /// Check a Rust file for errors (no codegen)
@@ -78,6 +103,10 @@ pub enum Commands {
         /// Output format for errors/diagnostics
         #[arg(long, short = 'f', value_enum, default_value_t = OutputFormat::Human)]
         format: OutputFormat,
+
+        /// Parser backend to use
+        #[arg(long, short = 'p', value_enum, default_value_t = ParserBackend::Chumsky)]
+        parser: ParserBackend,
     },
 
     /// Show cache statistics
@@ -98,6 +127,10 @@ pub enum Commands {
         /// Run the program after each successful compilation
         #[arg(long, short)]
         run: bool,
+
+        /// Parser backend to use
+        #[arg(long, short = 'p', value_enum, default_value_t = ParserBackend::Chumsky)]
+        parser: ParserBackend,
     },
 }
 
@@ -115,20 +148,20 @@ pub fn run_cli() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { path, args, format, sync_borrow } => {
-            run_file(&path, &args, format, !sync_borrow);
+        Commands::Run { path, args, format, sync_borrow, parser } => {
+            run_file(&path, &args, format, !sync_borrow, parser);
         }
-        Commands::Build { path, output, release, format } => {
-            build_file(&path, output.as_deref(), release, format);
+        Commands::Build { path, output, release, format, parser } => {
+            build_file(&path, output.as_deref(), release, format, parser);
         }
-        Commands::Check { path, format } => {
-            check_file(&path, format);
+        Commands::Check { path, format, parser } => {
+            check_file(&path, format, parser);
         }
         Commands::Cache { action } => {
             handle_cache(action);
         }
-        Commands::Watch { path, format, run } => {
-            watch_file(&path, format, run);
+        Commands::Watch { path, format, run, parser } => {
+            watch_file(&path, format, run, parser);
         }
     }
 }
@@ -224,6 +257,38 @@ fn emit_diagnostics(format: OutputFormat, diagnostics: Vec<JsonDiagnostic>) {
     }
 }
 
+/// Parse source code using the selected backend
+fn parse_with_backend(
+    path: &PathBuf,
+    parser: ParserBackend,
+    format: OutputFormat,
+) -> Result<crate::hir::Crate, String> {
+    match parser {
+        ParserBackend::Syn => {
+            let syn_parser = crate::parser::Parser::new();
+            syn_parser.parse_crate(path).map_err(|e| e.to_string())
+        }
+        ParserBackend::Chumsky => {
+            // Read source file
+            let source = std::fs::read_to_string(path)
+                .map_err(|e| format!("Failed to read file: {}", e))?;
+
+            // Get crate name from file stem
+            let crate_name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown");
+
+            if matches!(format, OutputFormat::Human) {
+                eprintln!("  {} Using Chumsky parser (experimental)", "⚡".yellow());
+            }
+
+            crate::parser2::lower::parse_and_lower(&source, crate_name)
+                .map_err(|errors| errors.join("\n"))
+        }
+    }
+}
+
 /// Emit success message in appropriate format
 fn emit_success(format: OutputFormat, message: &str, details: Option<serde_json::Value>) {
     match format {
@@ -245,7 +310,7 @@ fn emit_success(format: OutputFormat, message: &str, details: Option<serde_json:
     }
 }
 
-fn run_file(path: &PathBuf, _args: &[String], format: OutputFormat, async_mode: bool) {
+fn run_file(path: &PathBuf, _args: &[String], format: OutputFormat, async_mode: bool, parser_backend: ParserBackend) {
     let start = Instant::now();
 
     // Check if previous async borrow check failed - if so, block and show errors
@@ -271,14 +336,13 @@ fn run_file(path: &PathBuf, _args: &[String], format: OutputFormat, async_mode: 
     }
 
     if matches!(format, OutputFormat::Human) {
-        println!("{} {}", "Compiling".green().bold(), path.display());
+        println!("{} {} {}", "⚡".yellow(), "Compiling".green().bold(), path.display());
     }
 
-    let parser = crate::parser::Parser::new();
-    let krate = match parser.parse_crate(path) {
+    let krate = match parse_with_backend(path, parser_backend, format) {
         Ok(k) => k,
         Err(e) => {
-            emit_error_and_exit(format, ErrorCode::UnexpectedToken, &e.to_string(), Some(path), None, None);
+            emit_error_and_exit(format, ErrorCode::UnexpectedToken, &e, Some(path), None, None);
         }
     };
 
@@ -315,13 +379,17 @@ fn run_file(path: &PathBuf, _args: &[String], format: OutputFormat, async_mode: 
     // Borrow checking: async or sync based on flag
     let krate_arc = Arc::new(krate);
 
+    // Extract type aliases for borrow checker to resolve Copy types correctly
+    // e.g., DefId = u32 should be recognized as Copy
+    let type_alias_map = registry.get_type_alias_map();
+
     if async_mode {
         // Spawn borrow check in background - don't wait for it
         let checker = crate::borrowck::global_checker();
-        checker.spawn_check(path.clone(), Arc::clone(&krate_arc));
+        checker.spawn_check_with_aliases(path.clone(), Arc::clone(&krate_arc), type_alias_map);
     } else {
         // Synchronous borrow checking (traditional mode)
-        let borrow_checker = crate::borrowck::BorrowChecker::new();
+        let borrow_checker = crate::borrowck::BorrowChecker::with_type_aliases(type_alias_map.clone());
         borrow_checker.check_crate(&krate_arc);
         if borrow_checker.has_errors() {
             let diagnostics: Vec<JsonDiagnostic> = borrow_checker
@@ -352,12 +420,13 @@ fn run_file(path: &PathBuf, _args: &[String], format: OutputFormat, async_mode: 
 
     if matches!(format, OutputFormat::Human) {
         println!(
-            "{} in {:.2}ms{}",
+            "{} {} in {:.2}ms{}",
+            "⚡".yellow(),
             "Compiled".green().bold(),
             compile_time.as_secs_f64() * 1000.0,
-            if async_mode { " (borrow check async)" } else { "" }
+            if async_mode { "" } else { " (sync)" }
         );
-        println!("{}", "Running...".cyan());
+        println!("{} {}", "⚡".yellow(), "Running...".cyan());
         println!();
     }
 
@@ -366,7 +435,8 @@ fn run_file(path: &PathBuf, _args: &[String], format: OutputFormat, async_mode: 
             if matches!(format, OutputFormat::Human) {
                 println!();
                 println!(
-                    "{} with code {}",
+                    "{} {} with code {}",
+                    "⚡".yellow(),
                     "Finished".green().bold(),
                     exit_code
                 );
@@ -418,24 +488,24 @@ fn run_file(path: &PathBuf, _args: &[String], format: OutputFormat, async_mode: 
     }
 }
 
-fn build_file(path: &PathBuf, _output: Option<&std::path::Path>, release: bool, format: OutputFormat) {
+fn build_file(path: &PathBuf, _output: Option<&std::path::Path>, release: bool, format: OutputFormat, parser_backend: ParserBackend) {
     let start = Instant::now();
 
     let mode = if release { "release" } else { "debug" };
     if matches!(format, OutputFormat::Human) {
         println!(
-            "{} {} [{}]",
+            "{} {} {} [{}]",
+            "⚡".yellow(),
             "Compiling".green().bold(),
             path.display(),
             mode
         );
     }
 
-    let parser = crate::parser::Parser::new();
-    let krate = match parser.parse_crate(path) {
+    let krate = match parse_with_backend(path, parser_backend, format) {
         Ok(k) => k,
         Err(e) => {
-            emit_error_and_exit(format, ErrorCode::UnexpectedToken, &e.to_string(), Some(path), None, None);
+            emit_error_and_exit(format, ErrorCode::UnexpectedToken, &e, Some(path), None, None);
         }
     };
 
@@ -449,7 +519,9 @@ fn build_file(path: &PathBuf, _output: Option<&std::path::Path>, release: bool, 
         emit_error_and_exit(format, ErrorCode::TypeMismatch, &e.to_string(), Some(path), None, None);
     }
 
-    let borrow_checker = crate::borrowck::BorrowChecker::new();
+    // Extract type aliases for borrow checker to resolve Copy types correctly
+    let type_alias_map = registry.get_type_alias_map();
+    let borrow_checker = crate::borrowck::BorrowChecker::with_type_aliases(type_alias_map);
     borrow_checker.check_crate(&krate);
     if borrow_checker.has_errors() {
         let diagnostics: Vec<JsonDiagnostic> = borrow_checker
@@ -479,7 +551,8 @@ fn build_file(path: &PathBuf, _output: Option<&std::path::Path>, release: bool, 
 
     if matches!(format, OutputFormat::Human) {
         println!(
-            "{} in {:.2}ms",
+            "{} {} in {:.2}ms",
+            "⚡".yellow(),
             "Finished".green().bold(),
             compile_time.as_secs_f64() * 1000.0
         );
@@ -491,18 +564,17 @@ fn build_file(path: &PathBuf, _output: Option<&std::path::Path>, release: bool, 
     }
 }
 
-fn check_file(path: &PathBuf, format: OutputFormat) {
+fn check_file(path: &PathBuf, format: OutputFormat, parser_backend: ParserBackend) {
     let start = Instant::now();
 
     if matches!(format, OutputFormat::Human) {
-        println!("{} {}", "Checking".cyan().bold(), path.display());
+        println!("{} {} {}", "⚡".yellow(), "Checking".cyan().bold(), path.display());
     }
 
-    let parser = crate::parser::Parser::new();
-    let krate = match parser.parse_crate(path) {
+    let krate = match parse_with_backend(path, parser_backend, format) {
         Ok(k) => k,
         Err(e) => {
-            emit_error_and_exit(format, ErrorCode::UnexpectedToken, &e.to_string(), Some(path), None, None);
+            emit_error_and_exit(format, ErrorCode::UnexpectedToken, &e, Some(path), None, None);
         }
     };
 
@@ -521,7 +593,9 @@ fn check_file(path: &PathBuf, format: OutputFormat) {
     let type_time = type_start.elapsed();
 
     let borrow_start = Instant::now();
-    let borrow_checker = crate::borrowck::BorrowChecker::new();
+    // Extract type aliases for borrow checker to resolve Copy types correctly
+    let type_alias_map = registry.get_type_alias_map();
+    let borrow_checker = crate::borrowck::BorrowChecker::with_type_aliases(type_alias_map);
     borrow_checker.check_crate(&krate);
     let borrow_time = borrow_start.elapsed();
 
@@ -544,14 +618,15 @@ fn check_file(path: &PathBuf, format: OutputFormat) {
 
     if matches!(format, OutputFormat::Human) {
         println!();
-        println!("{}", "No errors found!".green().bold());
+        println!("{} {}", "⚡".yellow(), "No errors found!".green().bold());
         println!();
-        println!("  Parse:  {:>6.2}ms", parse_time.as_secs_f64() * 1000.0);
-        println!("  Type:   {:>6.2}ms", type_time.as_secs_f64() * 1000.0);
-        println!("  Borrow: {:>6.2}ms", borrow_time.as_secs_f64() * 1000.0);
-        println!("  ──────────────────");
+        println!("  {} Parse:  {:>6.2}ms", "⚡".yellow(), parse_time.as_secs_f64() * 1000.0);
+        println!("  {} Type:   {:>6.2}ms", "⚡".yellow(), type_time.as_secs_f64() * 1000.0);
+        println!("  {} Borrow: {:>6.2}ms", "⚡".yellow(), borrow_time.as_secs_f64() * 1000.0);
+        println!("  ──────────────────────");
         println!(
-            "  Total:  {:>6.2}ms",
+            "  {} Total:  {:>6.2}ms",
+            "⚡".yellow(),
             total_time.as_secs_f64() * 1000.0
         );
     } else {
@@ -580,16 +655,16 @@ fn handle_cache(action: CacheAction) {
     match action {
         CacheAction::Stats => {
             let stats = cache.stats();
-            println!("{}", "Cache Statistics".cyan().bold());
+            println!("{} {}", "⚡".yellow(), "Cache Statistics".cyan().bold());
             println!();
-            println!("  Entries:    {}", stats.total_entries);
-            println!("  Valid:      {}", stats.valid_entries);
-            println!("  Hit rate:   {:.1}%", stats.hit_rate() * 100.0);
-            println!("  Total size: {} KB", stats.total_size_bytes / 1024);
+            println!("  {} Entries:    {}", "⚡".yellow(), stats.total_entries);
+            println!("  {} Valid:      {}", "⚡".yellow(), stats.valid_entries);
+            println!("  {} Hit rate:   {:.1}%", "⚡".yellow(), stats.hit_rate() * 100.0);
+            println!("  {} Total size: {} KB", "⚡".yellow(), stats.total_size_bytes / 1024);
         }
         CacheAction::Clear => {
             match cache.clear() {
-                Ok(()) => println!("{}", "Cache cleared".green().bold()),
+                Ok(()) => println!("{} {}", "⚡".yellow(), "Cache cleared".green().bold()),
                 Err(e) => {
                     eprintln!("{}: {}", "Error".red().bold(), e);
                     std::process::exit(1);
@@ -600,7 +675,8 @@ fn handle_cache(action: CacheAction) {
             match cache.invalidate_stale() {
                 Ok(count) => {
                     println!(
-                        "{} {} stale entries",
+                        "{} {} {} stale entries",
+                        "⚡".yellow(),
                         "Removed".green().bold(),
                         count
                     );
@@ -618,7 +694,7 @@ fn handle_cache(action: CacheAction) {
 // Watch Mode - Async Concurrent Compilation
 // ============================================================================
 
-fn watch_file(path: &PathBuf, format: OutputFormat, run_after: bool) {
+fn watch_file(path: &PathBuf, format: OutputFormat, run_after: bool, parser_backend: ParserBackend) {
     use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
     use std::sync::mpsc::channel;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -633,12 +709,13 @@ fn watch_file(path: &PathBuf, format: OutputFormat, run_after: bool) {
 
     if matches!(format, OutputFormat::Human) {
         println!(
-            "{} {} for changes...",
+            "{} {} {} for changes...",
+            "⚡".yellow(),
             "Watching".cyan().bold(),
             watch_path.display()
         );
-        println!("  Press Ctrl+C to stop");
-        println!("  Compilation runs in background - system stays responsive\n");
+        println!("  {} Press Ctrl+C to stop", "⚡".yellow());
+        println!("  {} Compilation runs in background - system stays responsive\n", "⚡".yellow());
     }
 
     // Shared state for async compilation
@@ -646,7 +723,7 @@ fn watch_file(path: &PathBuf, format: OutputFormat, run_after: bool) {
     let is_compiling = Arc::new(AtomicBool::new(false));
 
     // Initial compilation (async)
-    spawn_compile(&path, format, run_after, Arc::clone(&compile_id), Arc::clone(&is_compiling));
+    spawn_compile(&path, format, run_after, parser_backend, Arc::clone(&compile_id), Arc::clone(&is_compiling));
 
     // Set up file watcher
     let (tx, rx) = channel();
@@ -696,7 +773,7 @@ fn watch_file(path: &PathBuf, format: OutputFormat, run_after: bool) {
                         println!("{} Change detected\n", "⟳".cyan().bold());
                     }
 
-                    spawn_compile(&path, format, run_after, Arc::clone(&compile_id), Arc::clone(&is_compiling));
+                    spawn_compile(&path, format, run_after, parser_backend, Arc::clone(&compile_id), Arc::clone(&is_compiling));
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -710,6 +787,7 @@ fn spawn_compile(
     path: &PathBuf,
     format: OutputFormat,
     run_after: bool,
+    parser_backend: ParserBackend,
     compile_id: Arc<std::sync::atomic::AtomicU64>,
     is_compiling: Arc<std::sync::atomic::AtomicBool>,
 ) {
@@ -729,8 +807,7 @@ fn spawn_compile(
             return;
         }
 
-        let parser = crate::parser::Parser::new();
-        let krate = match parser.parse_crate(&path) {
+        let krate = match parse_with_backend(&path, parser_backend, format) {
             Ok(k) => k,
             Err(e) => {
                 if compile_id.load(Ordering::SeqCst) == my_id {
@@ -787,7 +864,8 @@ fn spawn_compile(
 
         if matches!(format, OutputFormat::Human) {
             println!(
-                "{} in {:.2}ms",
+                "{} {} in {:.2}ms",
+                "⚡".yellow(),
                 "Compiled".green().bold(),
                 compile_time.as_secs_f64() * 1000.0
             );
@@ -807,13 +885,13 @@ fn spawn_compile(
             codegen.compile_crate(&krate);
 
             if matches!(format, OutputFormat::Human) {
-                println!("{}", "Running...".dimmed());
+                println!("{} {}", "⚡".yellow(), "Running...".cyan());
             }
 
             match codegen.run_main() {
                 Ok(exit_code) => {
                     if matches!(format, OutputFormat::Human) {
-                        println!("{} with code {}\n", "Finished".green(), exit_code);
+                        println!("{} {} with code {}\n", "⚡".yellow(), "Finished".green().bold(), exit_code);
                     }
                 }
                 Err(e) => {

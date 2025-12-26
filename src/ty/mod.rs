@@ -875,7 +875,24 @@ impl TypeRegistry {
             // Resolve type arguments if present
             let type_args = self.resolve_generic_args(segment, subst);
 
-            // Check for built-in collection/wrapper types
+            // Check for user-defined struct/enum first (takes priority over built-ins)
+            if let Some(struct_def) = self.struct_defs.read().get(name).cloned() {
+                return self.intern(Ty::Adt {
+                    def_id: struct_def.def_id,
+                    name: name.clone(),
+                    args: type_args,
+                });
+            }
+
+            if let Some(enum_def) = self.enum_defs.read().get(name).cloned() {
+                return self.intern(Ty::Adt {
+                    def_id: enum_def.def_id,
+                    name: name.clone(),
+                    args: type_args,
+                });
+            }
+
+            // Fall back to built-in collection/wrapper types only if not user-defined
             match name.as_str() {
                 "Vec" => {
                     let elem_ty = type_args.first().copied().unwrap_or_else(|| self.intern(Ty::Error));
@@ -898,24 +915,6 @@ impl TypeRegistry {
                     return self.intern(Ty::Result { ok: ok_ty, err: err_ty });
                 }
                 _ => {}
-            }
-
-            // Check for struct definition
-            if let Some(struct_def) = self.struct_defs.read().get(name).cloned() {
-                return self.intern(Ty::Adt {
-                    def_id: struct_def.def_id,
-                    name: name.clone(),
-                    args: type_args,
-                });
-            }
-
-            // Check for enum definition
-            if let Some(enum_def) = self.enum_defs.read().get(name).cloned() {
-                return self.intern(Ty::Adt {
-                    def_id: enum_def.def_id,
-                    name: name.clone(),
-                    args: type_args,
-                });
             }
 
             // Check for type alias
@@ -1542,6 +1541,81 @@ impl TypeRegistry {
     /// Check if a method exists on a type
     pub fn has_method(&self, receiver_ty: TyId, method_name: &str) -> bool {
         self.resolve_method(receiver_ty, method_name).is_some()
+    }
+
+    /// Extract type aliases as a simple name -> base_type map for the borrow checker.
+    /// This resolves HIR types to their base primitive/struct names.
+    /// For example: "DefId" -> "u32", "TypeId" -> "u32"
+    pub fn get_type_alias_map(&self) -> std::collections::HashMap<String, String> {
+        let aliases = self.type_aliases.read();
+        let mut result = std::collections::HashMap::new();
+
+        for (name, (_generics, hir_ty)) in aliases.iter() {
+            // Extract the base type name from the HIR type
+            let base_type = self.extract_base_type_name(hir_ty);
+            result.insert(name.clone(), base_type);
+        }
+
+        // Also add newtype structs (single-field tuple structs wrapping Copy types)
+        // These are a common pattern for creating distinct types that are still Copy
+        let structs = self.struct_defs.read();
+        for (name, struct_def) in structs.iter() {
+            // Single-field tuple structs
+            if struct_def.is_tuple && struct_def.fields.len() == 1 {
+                let (_, field_ty) = &struct_def.fields[0];
+                let field_type_name = self.extract_base_type_name(field_ty);
+                // If inner type is primitive Copy type, the wrapper is likely Copy too
+                if self.is_primitive_copy_type(&field_type_name) {
+                    result.insert(name.clone(), field_type_name);
+                }
+            }
+            // Also check for structs with all Copy fields (common for Span-like types)
+            else if struct_def.fields.len() <= 4 {
+                // Small structs with all primitive fields are usually Copy
+                let all_copy = struct_def.fields.iter().all(|(_, field_ty)| {
+                    let ft = self.extract_base_type_name(field_ty);
+                    self.is_primitive_copy_type(&ft)
+                });
+                if all_copy {
+                    result.insert(name.clone(), "copy_struct".to_string());
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Check if a type name is a primitive Copy type
+    fn is_primitive_copy_type(&self, type_name: &str) -> bool {
+        matches!(type_name,
+            "i8" | "i16" | "i32" | "i64" | "i128" | "isize" |
+            "u8" | "u16" | "u32" | "u64" | "u128" | "usize" |
+            "f32" | "f64" | "bool" | "char" | "()"
+        ) || type_name.starts_with("&") || type_name.starts_with("*")
+    }
+
+    /// Extract the base type name from an HIR type for alias resolution
+    fn extract_base_type_name(&self, ty: &HirType) -> String {
+        match &ty.kind {
+            TypeKind::Unit => "()".to_string(),
+            TypeKind::Bool => "bool".to_string(),
+            TypeKind::Char => "char".to_string(),
+            TypeKind::Int(int_ty) => format!("{:?}", int_ty).to_lowercase(),
+            TypeKind::Uint(uint_ty) => format!("{:?}", uint_ty).to_lowercase(),
+            TypeKind::Float(float_ty) => format!("{:?}", float_ty).to_lowercase(),
+            TypeKind::Str => "str".to_string(),
+            TypeKind::Never => "!".to_string(),
+            TypeKind::Ref { .. } => "&".to_string(),
+            TypeKind::Ptr { .. } => "*".to_string(),
+            TypeKind::Path(path) => {
+                // Use the last segment's identifier
+                path.segments
+                    .last()
+                    .map(|s| s.ident.clone())
+                    .unwrap_or_else(|| "Unknown".to_string())
+            }
+            _ => "Unknown".to_string(),
+        }
     }
 }
 
