@@ -231,14 +231,44 @@ impl LowerContext {
 
                     let method_def_id = self.alloc_def_id();
 
+                    // Resolve Self to the actual impl type
+                    let resolve_self = |ty: Type, self_ty: &Type| -> Type {
+                        match &ty.kind {
+                            TypeKind::Path(path) if path.segments.len() == 1
+                                && path.segments[0].ident == "Self" => {
+                                self_ty.clone()
+                            }
+                            TypeKind::Ref { lifetime, mutable, inner } => {
+                                if let TypeKind::Path(path) = &inner.kind {
+                                    if path.segments.len() == 1 && path.segments[0].ident == "Self" {
+                                        return Type {
+                                            kind: TypeKind::Ref {
+                                                lifetime: lifetime.clone(),
+                                                mutable: *mutable,
+                                                inner: Box::new(self_ty.clone()),
+                                            },
+                                            span: ty.span,
+                                        };
+                                    }
+                                }
+                                ty
+                            }
+                            _ => ty,
+                        }
+                    };
+
                     let inputs: Vec<(String, Type)> = f.params.iter().map(|p| {
                         let pname = self.pattern_name(&p.pattern);
                         let ty = self.lower_type(&p.ty);
+                        let ty = resolve_self(ty, &self_ty);
                         (pname, ty)
                     }).collect();
 
                     let output = f.ret_type.as_ref()
-                        .map(|t| self.lower_type(t))
+                        .map(|t| {
+                            let ty = self.lower_type(t);
+                            resolve_self(ty, &self_ty)
+                        })
                         .unwrap_or_else(|| Type {
                             kind: TypeKind::Unit,
                             span: self.convert_span(impl_item.span),
