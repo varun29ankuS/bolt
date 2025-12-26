@@ -248,15 +248,73 @@ fn pattern_parser() -> impl Parser<TokenKind, Pattern, Error = ParseError> + Clo
                 inner: Box::new(inner),
             });
 
+        // Tuple struct pattern: Path(pat, pat, ...)
+        let tuple_struct_pat = path_parser()
+            .then(
+                pat.clone()
+                    .separated_by(just(TokenKind::Comma))
+                    .allow_trailing()
+                    .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
+            )
+            .map(|(path, fields)| PatternKind::TupleStruct { path, fields });
+
+        // Struct pattern: Path { field, field: pat, .. }
+        let field_pat = ident()
+            .then(just(TokenKind::Colon).ignore_then(pat.clone()).or_not())
+            .map_with_span(|(name, pat), span| {
+                let shorthand = pat.is_none();
+                let pattern = pat.unwrap_or_else(|| Pattern {
+                    kind: PatternKind::Ident {
+                        by_ref: false,
+                        mutable: false,
+                        name: name.clone(),
+                        subpat: None,
+                    },
+                    span: span_from_range(span),
+                });
+                FieldPat {
+                    name,
+                    pattern,
+                    shorthand,
+                }
+            });
+        let struct_pat = path_parser()
+            .then(
+                field_pat
+                    .separated_by(just(TokenKind::Comma))
+                    .allow_trailing()
+                    .then(just(TokenKind::DotDot).or_not())
+                    .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
+            )
+            .map(|(path, (fields, rest))| PatternKind::Struct {
+                path,
+                fields,
+                rest: rest.is_some(),
+            });
+
         let path_pat = path_parser().map(PatternKind::Path);
+
+        // Qualified path pattern: Path::Variant (without parens/braces)
+        // Must check for :: to distinguish from simple ident bindings
+        let qualified_path_pat = path_parser()
+            .try_map(|path, span| {
+                if path.segments.len() > 1 {
+                    Ok(PatternKind::Path(path))
+                } else {
+                    Err(Simple::custom(span, "not a qualified path"))
+                }
+            });
 
         let base = choice((
             wild,
             ref_pat,
             tuple_pat,
             lit_pat,
+            tuple_struct_pat,  // Must come before ident_pat to handle Path(...)
+            struct_pat,        // Must come before ident_pat to handle Path{...}
+            qualified_path_pat, // Qualified paths like Option::None before ident
             ident_pat,
-            path_pat,
+            path_pat,          // Single-segment paths like None
         ));
 
         // Or patterns: a | b | c
@@ -288,6 +346,18 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
         // Atoms
         let lit_expr = lit().map(ExprKind::Lit);
         let path_expr = path_parser().map(ExprKind::Path);
+
+        // self as an expression (for method bodies)
+        let self_expr = keyword(Keyword::SelfLower).map_with_span(|_, span| {
+            let s = span_from_range(span);
+            ExprKind::Path(Path {
+                segments: vec![PathSegment {
+                    ident: Ident::new("self".to_string(), s),
+                    args: None,
+                }],
+                span: s,
+            })
+        });
 
         let tuple_expr = expr.clone()
             .separated_by(just(TokenKind::Comma))
@@ -416,6 +486,7 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
             block_expr,
             tuple_expr,
             array_expr,
+            self_expr,  // must come before path_expr
             path_expr,
         ))
         .map_with_span(|kind, span| Expr { kind, span: span_from_range(span) })
@@ -454,9 +525,13 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
                 .allow_trailing()
                 .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
                 .map(PostfixOp::StructLit),
-            // Method call or field access: .ident or .ident(args)
+            // Method call or field access: .ident or .ident(args) or .0 (tuple index)
             just(TokenKind::Dot)
-                .ignore_then(ident())
+                .ignore_then(
+                    ident()
+                        .or(select! { TokenKind::Int(n) => n }
+                            .map_with_span(|n, span| Ident::new(n.to_string(), span_from_range(span))))
+                )
                 .then(
                     expr.clone()
                         .separated_by(just(TokenKind::Comma))
@@ -627,8 +702,37 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
                 kind: ExprKind::Binary { op, left: Box::new(a), right: Box::new(b) },
             });
 
+        // Range expressions: a..b, a..=b, a..
+        // Note: Prefix ranges (..b, ..) are parsed as atoms
+        let logical_or_boxed = logical_or.clone().boxed();
+        let range = logical_or_boxed.clone()
+            .then(
+                choice((
+                    just(TokenKind::DotDotEq)
+                        .ignore_then(logical_or_boxed.clone())
+                        .map(|end| (true, Some(end))),
+                    just(TokenKind::DotDot)
+                        .ignore_then(logical_or_boxed.clone().or_not())
+                        .map(|end| (false, end)),
+                ))
+                .or_not()
+            )
+            .map_with_span(|(start, range_end), span| {
+                match range_end {
+                    Some((inclusive, end)) => Expr {
+                        kind: ExprKind::Range {
+                            start: Some(Box::new(start)),
+                            end: end.map(Box::new),
+                            inclusive,
+                        },
+                        span: span_from_range(span),
+                    },
+                    None => start,
+                }
+            });
+
         // Assignment
-        let assign = logical_or.clone()
+        let assign = range.clone()
             .then(
                 choice((
                     just(TokenKind::Eq).to(None),
@@ -637,7 +741,7 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
                     just(TokenKind::StarEq).to(Some(BinOp::Mul)),
                     just(TokenKind::SlashEq).to(Some(BinOp::Div)),
                 ))
-                .then(logical_or.clone())
+                .then(range.clone())
                 .or_not()
             )
             .map(|(left, rhs)| {
@@ -871,15 +975,105 @@ fn item_parser() -> impl Parser<TokenKind, Item, Error = ParseError> + Clone {
     })
 }
 
+fn self_type() -> Type {
+    Type {
+        kind: TypeKind::Path(Path {
+            segments: vec![PathSegment {
+                ident: Ident::new("Self".to_string(), Span::dummy()),
+                args: None,
+            }],
+            span: Span::dummy(),
+        }),
+        span: Span::dummy(),
+    }
+}
+
+fn self_pattern(mutable: bool, span: Span) -> Pattern {
+    Pattern {
+        kind: PatternKind::Ident {
+            mutable,
+            by_ref: false,
+            name: Ident::new("self".to_string(), span),
+            subpat: None,
+        },
+        span,
+    }
+}
+
 fn param_parser() -> impl Parser<TokenKind, Param, Error = ParseError> + Clone {
-    pattern_parser()
+    // Self parameter variants: self, mut self, &self, &mut self
+    let self_param = choice((
+        // &mut self
+        just(TokenKind::And)
+            .ignore_then(keyword(Keyword::Mut))
+            .ignore_then(keyword(Keyword::SelfLower))
+            .map_with_span(|_, span| {
+                let s = span_from_range(span);
+                Param {
+                    pattern: self_pattern(false, s),
+                    ty: Type {
+                        kind: TypeKind::Ref {
+                            lifetime: None,
+                            mutable: true,
+                            inner: Box::new(self_type()),
+                        },
+                        span: s,
+                    },
+                    span: s,
+                }
+            }),
+        // &self
+        just(TokenKind::And)
+            .ignore_then(keyword(Keyword::SelfLower))
+            .map_with_span(|_, span| {
+                let s = span_from_range(span);
+                Param {
+                    pattern: self_pattern(false, s),
+                    ty: Type {
+                        kind: TypeKind::Ref {
+                            lifetime: None,
+                            mutable: false,
+                            inner: Box::new(self_type()),
+                        },
+                        span: s,
+                    },
+                    span: s,
+                }
+            }),
+        // mut self
+        keyword(Keyword::Mut)
+            .ignore_then(keyword(Keyword::SelfLower))
+            .map_with_span(|_, span| {
+                let s = span_from_range(span);
+                Param {
+                    pattern: self_pattern(true, s),
+                    ty: self_type(),
+                    span: s,
+                }
+            }),
+        // self
+        keyword(Keyword::SelfLower)
+            .map_with_span(|_, span| {
+                let s = span_from_range(span);
+                Param {
+                    pattern: self_pattern(false, s),
+                    ty: self_type(),
+                    span: s,
+                }
+            }),
+    ));
+
+    // Regular parameter: pattern: type
+    let regular_param = pattern_parser()
         .then_ignore(just(TokenKind::Colon))
         .then(type_parser())
         .map_with_span(|(pattern, ty), span| Param {
             pattern,
             ty,
             span: span_from_range(span),
-        })
+        });
+
+    choice((self_param, regular_param))
 }
 
 fn field_parser() -> impl Parser<TokenKind, Field, Error = ParseError> + Clone {
