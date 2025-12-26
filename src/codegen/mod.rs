@@ -1466,7 +1466,9 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             let var = Variable::from_u32(self.next_var as u32);
             self.next_var += 1;
             self.builder.declare_var(var, ty);
-            self.builder.def_var(var, val);
+            // Coerce value to match declared type
+            let coerced_val = self.coerce_to_type(val, ty);
+            self.builder.def_var(var, coerced_val);
             self.locals.insert(name.clone(), LocalInfo { var, ty });
             if let Some(tn) = type_name {
                 self.local_types.insert(name.clone(), tn);
@@ -1665,18 +1667,25 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             ExprKind::If { cond, then_branch, else_branch } => {
                 let cond_val = self.translate_expr(cond);
 
+                // Determine result type from the then branch
+                let result_type = if let Some(expr) = &then_branch.expr {
+                    self.expr_type(expr)
+                } else {
+                    types::I64 // unit type fallback
+                };
+
                 let then_block = self.builder.create_block();
                 let else_block = self.builder.create_block();
                 let merge_block = self.builder.create_block();
 
-                self.builder.append_block_param(merge_block, types::I64);
+                self.builder.append_block_param(merge_block, result_type);
 
                 self.builder.ins().brif(cond_val, then_block, &[], else_block, &[]);
 
                 self.builder.switch_to_block(then_block);
                 self.builder.seal_block(then_block);
                 let then_val = self.translate_block(then_branch).unwrap_or_else(|| {
-                    self.builder.ins().iconst(types::I64, 0)
+                    self.builder.ins().iconst(result_type, 0)
                 });
                 self.builder.ins().jump(merge_block, &[then_val]);
 
@@ -1685,7 +1694,7 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                 let else_val = if let Some(else_expr) = else_branch {
                     self.translate_expr(else_expr)
                 } else {
-                    self.builder.ins().iconst(types::I64, 0)
+                    self.builder.ins().iconst(result_type, 0)
                 };
                 self.builder.ins().jump(merge_block, &[else_val]);
 
@@ -1906,6 +1915,7 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                             self.builder.declare_var(var, ty);
                             let val = arg_vals.get(i).map(|(v, _)| *v)
                                 .unwrap_or_else(|| self.builder.ins().iconst(types::I64, 0));
+                            let val = self.coerce_to_type(val, ty);
                             self.builder.def_var(var, val);
                             self.locals.insert(name.clone(), LocalInfo { var, ty });
                         }
@@ -1936,6 +1946,7 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                                     self.builder.declare_var(var, ty);
                                     let val = arg_vals.get(i).map(|(v, _)| *v)
                                         .unwrap_or_else(|| self.builder.ins().iconst(types::I64, 0));
+                                    let val = self.coerce_to_type(val, ty);
                                     self.builder.def_var(var, val);
                                     self.locals.insert(param_name.clone(), LocalInfo { var, ty });
                                 }
@@ -2070,9 +2081,11 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                                     // Store tuple fields at offset 8, 16, 24, ...
                                     for (i, arg) in args.iter().take(field_count).enumerate() {
                                         let val = self.translate_expr(arg);
+                                        // Coerce to I64 for uniform enum field storage
+                                        let val64 = self.coerce_to_type(val, types::I64);
                                         self.builder.ins().store(
                                             cranelift::prelude::MemFlags::new(),
-                                            val,
+                                            val64,
                                             ptr,
                                             (8 + i * 8) as i32,
                                         );
@@ -2382,7 +2395,13 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
 
                             if let Some(&func_id) = self.func_names.get(fn_name) {
                                 let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
-                                self.builder.ins().call(func_ref, &[arg_val]);
+                                // Coerce to I64 for integer types
+                                let coerced_val = if arg_ty == types::F64 || arg_ty == types::F32 {
+                                    arg_val
+                                } else {
+                                    self.coerce_to_type(arg_val, types::I64)
+                                };
+                                self.builder.ins().call(func_ref, &[coerced_val]);
                             }
                             return self.builder.ins().iconst(types::I64, 0);
                         }
@@ -3387,9 +3406,16 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             }
             ExprKind::Match { expr: scrutinee, arms } => {
                 let scrutinee_val = self.translate_expr(scrutinee);
-                
+
+                // Determine the result type from the first arm body
+                let result_type = if let Some(arm) = arms.first() {
+                    self.expr_type(&arm.body)
+                } else {
+                    types::I64
+                };
+
                 let merge_block = self.builder.create_block();
-                self.builder.append_block_param(merge_block, types::I64);
+                self.builder.append_block_param(merge_block, result_type);
                 
                 // Create blocks for each arm
                 let arm_blocks: Vec<Block> = arms.iter().map(|_| self.builder.create_block()).collect();
@@ -3668,10 +3694,10 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                     }
                 }
                 
-                // Fail block returns 0
+                // Fail block returns 0 of the appropriate type
                 self.builder.switch_to_block(fail_block);
                 self.builder.seal_block(fail_block);
-                let zero = self.builder.ins().iconst(types::I64, 0);
+                let zero = self.builder.ins().iconst(result_type, 0);
                 self.builder.ins().jump(merge_block, &[zero]);
                 
                 self.builder.switch_to_block(merge_block);
@@ -4146,6 +4172,63 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                 }
                 ptr
             }
+        }
+    }
+
+    /// Get the Cranelift type for an expression
+    fn expr_type(&self, expr: &Expr) -> types::Type {
+        match &expr.kind {
+            ExprKind::Lit(lit) => match lit {
+                Literal::Bool(_) => types::I8,
+                Literal::Char(_) => types::I32,
+                Literal::Int(_, _) | Literal::Uint(_, _) => types::I64,
+                Literal::Float(_, Some(FloatType::F32)) => types::F32,
+                Literal::Float(_, _) => types::F64,
+                Literal::Str(_) | Literal::ByteStr(_) => types::I64, // pointer
+            },
+            ExprKind::Binary { op, .. } => match op {
+                BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le |
+                BinaryOp::Gt | BinaryOp::Ge | BinaryOp::And | BinaryOp::Or => types::I8,
+                _ => types::I64,
+            },
+            ExprKind::Unary { op, .. } => match op {
+                UnaryOp::Not => types::I8, // Could be bool
+                UnaryOp::Neg => types::I64,
+            },
+            ExprKind::If { then_branch, .. } => {
+                // Get type from the then branch's expression
+                if let Some(expr) = &then_branch.expr {
+                    self.expr_type(expr)
+                } else {
+                    types::I64 // unit -> treat as i64
+                }
+            },
+            ExprKind::Match { arms, .. } => {
+                if let Some(arm) = arms.first() {
+                    self.expr_type(&arm.body)
+                } else {
+                    types::I64
+                }
+            },
+            ExprKind::Block(block) => {
+                if let Some(expr) = &block.expr {
+                    self.expr_type(expr)
+                } else {
+                    types::I64
+                }
+            },
+            ExprKind::Path(path) => {
+                // Look up the actual type from locals
+                if path.segments.len() == 1 {
+                    let name = &path.segments[0].ident;
+                    if let Some(local_info) = self.locals.get(name) {
+                        return local_info.ty;
+                    }
+                }
+                types::I64 // Default for unknown paths
+            }
+            ExprKind::Call { .. } | ExprKind::MethodCall { .. } => types::I64,
+            _ => types::I64, // Default
         }
     }
 
