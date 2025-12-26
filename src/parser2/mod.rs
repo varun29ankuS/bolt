@@ -11,6 +11,7 @@
 //! ```
 
 pub mod ast;
+pub mod lower;
 
 use crate::lexer::{cook_tokens, Lexer, Span, Token, TokenKind, Keyword};
 use ast::*;
@@ -34,9 +35,11 @@ pub fn parse(source: &str) -> (Option<SourceFile>, Vec<ParseError>) {
         .collect();
 
     // Create token stream for chumsky
+    // Filter out EOF tokens - Chumsky expects stream to end, not an EOF token
     let len = source.len();
     let token_stream: Vec<(TokenKind, std::ops::Range<usize>)> = tokens
         .into_iter()
+        .filter(|t| !matches!(t.kind, TokenKind::Eof))
         .map(|t| (t.kind, t.span.start as usize..t.span.end as usize))
         .collect();
 
@@ -99,7 +102,26 @@ fn lifetime() -> impl Parser<TokenKind, Ident, Error = ParseError> + Clone {
 
 fn type_parser() -> impl Parser<TokenKind, Type, Error = ParseError> + Clone {
     recursive(|ty| {
-        let path_type = path_parser()
+        // Path type with generics - uses the recursive ty handle for generic args
+        let generic_args = ty.clone()
+            .separated_by(just(TokenKind::Comma))
+            .allow_trailing()
+            .delimited_by(just(TokenKind::Lt), just(TokenKind::Gt))
+            .map(|args| GenericArgs {
+                args: args.into_iter().map(GenericArg::Type).collect(),
+            });
+
+        let segment = ident()
+            .then(generic_args.or_not())
+            .map(|(ident, args)| PathSegment { ident, args });
+
+        let path_type = segment
+            .separated_by(just(TokenKind::PathSep))
+            .at_least(1)
+            .map_with_span(|segments, span| Path {
+                segments,
+                span: span_from_range(span),
+            })
             .map(TypeKind::Path);
 
         let ref_type = just(TokenKind::And)
@@ -176,17 +198,10 @@ fn type_bounds() -> impl Parser<TokenKind, Vec<TypeBound>, Error = ParseError> +
 // ============================================================================
 
 fn path_parser() -> impl Parser<TokenKind, Path, Error = ParseError> + Clone {
-    let generic_args = type_parser()
-        .separated_by(just(TokenKind::Comma))
-        .allow_trailing()
-        .delimited_by(just(TokenKind::Lt), just(TokenKind::Gt))
-        .map(|args| GenericArgs {
-            args: args.into_iter().map(GenericArg::Type).collect(),
-        });
-
+    // Simple path parser for expressions - no generic args to avoid mutual recursion
+    // Turbofish syntax (e.g., Vec::<i32>::new()) can be handled separately if needed
     let segment = ident()
-        .then(generic_args.or_not())
-        .map(|(ident, args)| PathSegment { ident, args });
+        .map(|ident| PathSegment { ident, args: None });
 
     segment
         .separated_by(just(TokenKind::PathSep))
@@ -406,6 +421,21 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
         .map_with_span(|kind, span| Expr { kind, span: span_from_range(span) })
         .boxed();
 
+        // Struct literal field: name: expr  or  name (shorthand)
+        let struct_field = ident()
+            .then(just(TokenKind::Colon).ignore_then(expr.clone()).or_not())
+            .map(|(name, value)| {
+                let shorthand = value.is_none();
+                let value = value.unwrap_or_else(|| Expr {
+                    kind: ExprKind::Path(Path {
+                        segments: vec![PathSegment { ident: name.clone(), args: None }],
+                        span: name.span,
+                    }),
+                    span: name.span,
+                });
+                FieldExpr { name, value, shorthand }
+            });
+
         // Postfix operations as an enum for proper folding
         #[derive(Clone)]
         enum PostfixOp {
@@ -414,9 +444,16 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
             Call(Vec<Expr>),
             Index(Expr),
             Try,
+            StructLit(Vec<FieldExpr>),  // Struct literal: { fields }
         }
 
         let postfix_op = choice((
+            // Struct literal: { field: expr, ... } - must come before other braces
+            struct_field.clone()
+                .separated_by(just(TokenKind::Comma))
+                .allow_trailing()
+                .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
+                .map(PostfixOp::StructLit),
             // Method call or field access: .ident or .ident(args)
             just(TokenKind::Dot)
                 .ignore_then(ident())
@@ -447,7 +484,7 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
             just(TokenKind::Question).to(PostfixOp::Try),
         ));
 
-        // Postfix: calls, fields, indexing
+        // Postfix: calls, fields, indexing, struct literals
         let postfix = atom.clone()
             .then(postfix_op.repeated())
             .foldl(|e, op| {
@@ -472,6 +509,23 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
                         index: Box::new(index),
                     },
                     PostfixOp::Try => ExprKind::Try(Box::new(e)),
+                    PostfixOp::StructLit(fields) => {
+                        // The previous expr should be a path for the struct name
+                        if let ExprKind::Path(path) = e.kind {
+                            ExprKind::Struct { path, fields, rest: None }
+                        } else {
+                            // Invalid: non-path followed by struct literal
+                            // Just return the fields as struct with dummy path
+                            ExprKind::Struct {
+                                path: Path {
+                                    segments: vec![],
+                                    span: e.span,
+                                },
+                                fields,
+                                rest: None,
+                            }
+                        }
+                    }
                 };
                 Expr { kind, span }
             });
