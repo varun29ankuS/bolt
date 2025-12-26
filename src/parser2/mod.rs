@@ -111,7 +111,13 @@ fn type_parser() -> impl Parser<TokenKind, Type, Error = ParseError> + Clone {
                 args: args.into_iter().map(GenericArg::Type).collect(),
             });
 
-        let segment = ident()
+        // Type segment can be an identifier or Self keyword
+        let type_ident = choice((
+            keyword(Keyword::SelfType).map_with_span(|_, span| Ident::new("Self".to_string(), span_from_range(span))),
+            ident(),
+        ));
+
+        let segment = type_ident
             .then(generic_args.or_not())
             .map(|(ident, args)| PathSegment { ident, args });
 
@@ -169,7 +175,29 @@ fn type_parser() -> impl Parser<TokenKind, Type, Error = ParseError> + Clone {
             .ignore_then(type_bounds())
             .map(TypeKind::DynTrait);
 
+        // Function pointer type: fn(Type1, Type2) -> RetType
+        let fn_ptr_type = keyword(Keyword::Fn)
+            .ignore_then(
+                ty.clone()
+                    .separated_by(just(TokenKind::Comma))
+                    .allow_trailing()
+                    .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
+            )
+            .then(
+                just(TokenKind::Arrow)
+                    .ignore_then(ty.clone())
+                    .or_not()
+            )
+            .map(|(params, ret)| TypeKind::Fn {
+                params,
+                ret: Box::new(ret.unwrap_or_else(|| Type {
+                    kind: TypeKind::Tuple(vec![]),
+                    span: Span::dummy(),
+                })),
+            });
+
         choice((
+            fn_ptr_type,
             ref_type,
             ptr_type,
             impl_trait,
@@ -200,10 +228,19 @@ fn type_bounds() -> impl Parser<TokenKind, Vec<TypeBound>, Error = ParseError> +
 fn path_parser() -> impl Parser<TokenKind, Path, Error = ParseError> + Clone {
     // Simple path parser for expressions - no generic args to avoid mutual recursion
     // Turbofish syntax (e.g., Vec::<i32>::new()) can be handled separately if needed
-    let segment = ident()
-        .map(|ident| PathSegment { ident, args: None });
 
-    segment
+    // Path segment can be an identifier or a keyword like crate/self/super/Self
+    let path_segment = choice((
+        // Keywords that can appear in paths
+        keyword(Keyword::Crate).map_with_span(|_, span| Ident::new("crate".to_string(), span_from_range(span))),
+        keyword(Keyword::SelfLower).map_with_span(|_, span| Ident::new("self".to_string(), span_from_range(span))),
+        keyword(Keyword::Super).map_with_span(|_, span| Ident::new("super".to_string(), span_from_range(span))),
+        keyword(Keyword::SelfType).map_with_span(|_, span| Ident::new("Self".to_string(), span_from_range(span))),
+        // Regular identifier
+        ident(),
+    )).map(|ident| PathSegment { ident, args: None });
+
+    path_segment
         .separated_by(just(TokenKind::PathSep))
         .at_least(1)
         .map_with_span(|segments, span| Path {
@@ -215,6 +252,74 @@ fn path_parser() -> impl Parser<TokenKind, Path, Error = ParseError> + Clone {
 // ============================================================================
 // Pattern Parser
 // ============================================================================
+
+// Simple pattern parser for closure params (no or-patterns to avoid conflict with |)
+// Supports one level of tuple nesting which covers most closure parameter patterns
+fn simple_pattern_parser() -> impl Parser<TokenKind, Pattern, Error = ParseError> + Clone {
+    // Inner simple pattern (no tuples to avoid infinite recursion)
+    let inner_simple = {
+        let wild = just(TokenKind::Underscore)
+            .map(|_| PatternKind::Wild);
+
+        let lit_pat = lit().map(PatternKind::Lit);
+
+        let ident_pat = keyword(Keyword::Ref).or_not()
+            .then(keyword(Keyword::Mut).or_not())
+            .then(ident())
+            .map(|((by_ref, mutable), name)| PatternKind::Ident {
+                by_ref: by_ref.is_some(),
+                mutable: mutable.is_some(),
+                name,
+                subpat: None,
+            });
+
+        choice((
+            wild,
+            lit_pat,
+            ident_pat,
+        ))
+        .map_with_span(|kind, span| Pattern { kind, span: span_from_range(span) })
+    };
+
+    let wild = just(TokenKind::Underscore)
+        .map(|_| PatternKind::Wild);
+
+    let lit_pat = lit().map(PatternKind::Lit);
+
+    let ident_pat = keyword(Keyword::Ref).or_not()
+        .then(keyword(Keyword::Mut).or_not())
+        .then(ident())
+        .map(|((by_ref, mutable), name)| PatternKind::Ident {
+            by_ref: by_ref.is_some(),
+            mutable: mutable.is_some(),
+            name,
+            subpat: None,
+        });
+
+    let ref_pat = just(TokenKind::And)
+        .ignore_then(keyword(Keyword::Mut).or_not().map(|m| m.is_some()))
+        .then(inner_simple.clone())
+        .map(|(mutable, inner)| PatternKind::Ref {
+            mutable,
+            inner: Box::new(inner),
+        });
+
+    // Tuple pattern for closures: (a, b, _) - uses inner_simple to avoid recursion
+    let tuple_pat = inner_simple
+        .separated_by(just(TokenKind::Comma))
+        .allow_trailing()
+        .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
+        .map(PatternKind::Tuple);
+
+    choice((
+        wild,
+        ref_pat,
+        tuple_pat,
+        lit_pat,
+        ident_pat,
+    ))
+    .map_with_span(|kind, span| Pattern { kind, span: span_from_range(span) })
+}
 
 fn pattern_parser() -> impl Parser<TokenKind, Pattern, Error = ParseError> + Clone {
     recursive(|pat| {
@@ -336,15 +441,102 @@ fn pattern_parser() -> impl Parser<TokenKind, Pattern, Error = ParseError> + Clo
 }
 
 // ============================================================================
+// Balanced Delimiter Parser (for macros)
+// ============================================================================
+
+/// Parser for balanced delimiters - handles nested braces/parens/brackets
+/// Defined separately to avoid nested recursive parser construction
+fn balanced_tokens_parser() -> impl Parser<TokenKind, (), Error = ParseError> + Clone {
+    recursive::<_, (), _, _, _>(|balanced| {
+        let nested_brace = just(TokenKind::LBrace)
+            .ignore_then(balanced.clone().repeated())
+            .then_ignore(just(TokenKind::RBrace))
+            .map(|_| ());
+        let nested_paren = just(TokenKind::LParen)
+            .ignore_then(balanced.clone().repeated())
+            .then_ignore(just(TokenKind::RParen))
+            .map(|_| ());
+        let nested_bracket = just(TokenKind::LBracket)
+            .ignore_then(balanced.clone().repeated())
+            .then_ignore(just(TokenKind::RBracket))
+            .map(|_| ());
+        let other = none_of([
+            TokenKind::LBrace, TokenKind::RBrace,
+            TokenKind::LParen, TokenKind::RParen,
+            TokenKind::LBracket, TokenKind::RBracket,
+        ]).ignored();
+        choice((nested_brace, nested_paren, nested_bracket, other))
+    })
+}
+
+// ============================================================================
 // Expression Parser
 // ============================================================================
 
-fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
-    recursive(|expr| {
-        let block = block_parser(expr.clone());
+fn expr_parser_with(
+    ty: impl Parser<TokenKind, Type, Error = ParseError> + Clone + 'static,
+    pat: impl Parser<TokenKind, Pattern, Error = ParseError> + Clone + 'static,
+    simple_pat: impl Parser<TokenKind, Pattern, Error = ParseError> + Clone + 'static,
+    balanced_tokens: impl Parser<TokenKind, (), Error = ParseError> + Clone + 'static,
+) -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
+    recursive(move |expr| {
+        let balanced_tokens = balanced_tokens.clone();
+        let ty = ty.clone();
+        let pat = pat.clone();
+        let simple_pat = simple_pat.clone();
+        let block = block_parser(expr.clone(), ty.clone(), pat.clone());
 
         // Atoms
         let lit_expr = lit().map(ExprKind::Lit);
+
+        // Macro call: path!(args) or path![args] or path!{args}
+        // Excludes macro_rules! which is a definition, not an invocation
+        let macro_call = path_parser()
+            .try_map(|path, span| {
+                // Reject macro_rules! as it's a definition, not invocation
+                if path.segments.len() == 1 && path.segments[0].ident.name == "macro_rules" {
+                    Err(Simple::custom(span, "macro_rules is a definition"))
+                } else {
+                    Ok(path)
+                }
+            })
+            .then_ignore(just(TokenKind::Not))
+            .then(
+                just(TokenKind::LParen)
+                    .ignore_then(balanced_tokens.clone().repeated())
+                    .then_ignore(just(TokenKind::RParen))
+                    .or(just(TokenKind::LBracket)
+                        .ignore_then(balanced_tokens.clone().repeated())
+                        .then_ignore(just(TokenKind::RBracket)))
+                    .or(just(TokenKind::LBrace)
+                        .ignore_then(balanced_tokens.clone().repeated())
+                        .then_ignore(just(TokenKind::RBrace)))
+            )
+            .map(|(path, _)| ExprKind::MacroCall { path, args: String::new() });
+
+        // macro_rules! name { ... } as an expression (skipped)
+        let macro_rules_expr = just(TokenKind::Ident("macro_rules".to_string()))
+            .ignore_then(just(TokenKind::Not))
+            .ignore_then(ident())
+            .then(
+                just(TokenKind::LBrace)
+                    .ignore_then(balanced_tokens.clone().repeated())
+                    .then_ignore(just(TokenKind::RBrace))
+                    .or(just(TokenKind::LParen)
+                        .ignore_then(balanced_tokens.clone().repeated())
+                        .then_ignore(just(TokenKind::RParen)))
+            )
+            .map_with_span(|(name, _), span| ExprKind::MacroCall {
+                path: Path {
+                    segments: vec![PathSegment {
+                        ident: Ident::new("macro_rules".to_string(), span_from_range(span.clone())),
+                        args: None,
+                    }],
+                    span: span_from_range(span),
+                },
+                args: String::new(),
+            });
+
         let path_expr = path_parser().map(ExprKind::Path);
 
         // self as an expression (for method bodies)
@@ -377,8 +569,18 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
             .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
             .map(|exprs| ExprKind::Array(ArrayExpr::List(exprs)));
 
+        // Let condition for if let / while let: let Pattern = expr
+        let let_cond = keyword(Keyword::Let)
+            .ignore_then(pat.clone())
+            .then_ignore(just(TokenKind::Eq))
+            .then(expr.clone())
+            .map_with_span(|(pat, e), span| Expr {
+                kind: ExprKind::Let { pat, expr: Box::new(e) },
+                span: span_from_range(span),
+            });
+
         let if_expr = keyword(Keyword::If)
-            .ignore_then(expr.clone())
+            .ignore_then(let_cond.clone().or(expr.clone()))
             .then(block.clone())
             .then(keyword(Keyword::Else).ignore_then(
                 block.clone().map(|b| Expr { kind: ExprKind::Block(b), span: Span::dummy() })
@@ -390,7 +592,7 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
                 else_branch: else_branch.map(Box::new),
             });
 
-        let match_arm = pattern_parser()
+        let match_arm = pat.clone()
             .then(just(TokenKind::Keyword(Keyword::If)).ignore_then(expr.clone()).or_not())
             .then_ignore(just(TokenKind::FatArrow))
             .then(expr.clone())
@@ -404,9 +606,10 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
         let match_expr = keyword(Keyword::Match)
             .ignore_then(expr.clone())
             .then(
+                // Match arms with optional commas (commas are optional after blocks)
                 match_arm
-                    .separated_by(just(TokenKind::Comma))
-                    .allow_trailing()
+                    .then_ignore(just(TokenKind::Comma).or_not())
+                    .repeated()
                     .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
             )
             .map(|(scrutinee, arms)| ExprKind::Match {
@@ -419,7 +622,7 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
             .map(|body| ExprKind::Loop { label: None, body });
 
         let while_expr = keyword(Keyword::While)
-            .ignore_then(expr.clone())
+            .ignore_then(let_cond.clone().or(expr.clone()))
             .then(block.clone())
             .map(|(cond, body)| ExprKind::While {
                 label: None,
@@ -428,7 +631,7 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
             });
 
         let for_expr = keyword(Keyword::For)
-            .ignore_then(pattern_parser())
+            .ignore_then(pat.clone())
             .then_ignore(keyword(Keyword::In))
             .then(expr.clone())
             .then(block.clone())
@@ -450,17 +653,18 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
         let continue_expr = keyword(Keyword::Continue)
             .map(|_| ExprKind::Continue(None));
 
+        // Closure: use simple_pat to avoid or-pattern conflict with | delimiter
         let closure = keyword(Keyword::Move).or_not()
             .then(
-                pattern_parser()
-                    .then(just(TokenKind::Colon).ignore_then(type_parser()).or_not())
-                    .map(|(pat, ty)| ClosureParam { pattern: pat, ty })
+                simple_pat.clone()
+                    .then(just(TokenKind::Colon).ignore_then(ty.clone()).or_not())
+                    .map(|(p, t)| ClosureParam { pattern: p, ty: t })
                     .separated_by(just(TokenKind::Comma))
                     .allow_trailing()
                     .delimited_by(just(TokenKind::Or), just(TokenKind::Or))
                     .or(just(TokenKind::OrOr).map(|_| Vec::new()))
             )
-            .then(just(TokenKind::Arrow).ignore_then(type_parser()).or_not())
+            .then(just(TokenKind::Arrow).ignore_then(ty.clone()).or_not())
             .then(expr.clone())
             .map(|(((is_move, params), ret_type), body)| ExprKind::Closure {
                 is_move: is_move.is_some(),
@@ -470,6 +674,11 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
             });
 
         let block_expr = block.clone().map(ExprKind::Block);
+
+        // Unsafe block: unsafe { ... }
+        let unsafe_expr = keyword(Keyword::Unsafe)
+            .ignore_then(block.clone())
+            .map(ExprKind::Unsafe);
 
         // Primary expression
         let atom = choice((
@@ -483,10 +692,13 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
             break_expr,
             continue_expr,
             closure,
+            unsafe_expr,  // must come before block_expr
             block_expr,
             tuple_expr,
             array_expr,
             self_expr,  // must come before path_expr
+            macro_rules_expr, // macro_rules! definitions (before macro_call)
+            macro_call, // must come before path_expr
             path_expr,
         ))
         .map_with_span(|kind, span| Expr { kind, span: span_from_range(span) })
@@ -511,12 +723,24 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
         #[derive(Clone)]
         enum PostfixOp {
             Field(Ident),
-            MethodCall(Ident, Vec<Expr>),
+            MethodCall(Ident, Option<GenericArgs>, Vec<Expr>),  // method, turbofish, args
             Call(Vec<Expr>),
             Index(Expr),
             Try,
             StructLit(Vec<FieldExpr>),  // Struct literal: { fields }
         }
+
+        // Turbofish: ::<Type1, Type2>
+        let turbofish = just(TokenKind::PathSep)
+            .ignore_then(
+                ty.clone()
+                    .separated_by(just(TokenKind::Comma))
+                    .allow_trailing()
+                    .delimited_by(just(TokenKind::Lt), just(TokenKind::Gt))
+            )
+            .map(|types| GenericArgs {
+                args: types.into_iter().map(GenericArg::Type).collect(),
+            });
 
         let postfix_op = choice((
             // Struct literal: { field: expr, ... } - must come before other braces
@@ -525,13 +749,14 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
                 .allow_trailing()
                 .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
                 .map(PostfixOp::StructLit),
-            // Method call or field access: .ident or .ident(args) or .0 (tuple index)
+            // Method call or field access: .ident or .ident::<T>(args) or .ident(args) or .0 (tuple index)
             just(TokenKind::Dot)
                 .ignore_then(
                     ident()
                         .or(select! { TokenKind::Int(n) => n }
                             .map_with_span(|n, span| Ident::new(n.to_string(), span_from_range(span))))
                 )
+                .then(turbofish.or_not())
                 .then(
                     expr.clone()
                         .separated_by(just(TokenKind::Comma))
@@ -539,9 +764,10 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
                         .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
                         .or_not()
                 )
-                .map(|(field, args)| {
+                .map(|((field, turbo), args)| {
                     match args {
-                        Some(args) => PostfixOp::MethodCall(field, args),
+                        Some(args) => PostfixOp::MethodCall(field, turbo, args),
+                        None if turbo.is_some() => PostfixOp::MethodCall(field, turbo, vec![]),
                         None => PostfixOp::Field(field),
                     }
                 }),
@@ -569,10 +795,10 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
                         expr: Box::new(e),
                         field,
                     },
-                    PostfixOp::MethodCall(method, args) => ExprKind::MethodCall {
+                    PostfixOp::MethodCall(method, turbofish, args) => ExprKind::MethodCall {
                         receiver: Box::new(e),
                         method,
-                        turbofish: None,
+                        turbofish,
                         args,
                     },
                     PostfixOp::Call(args) => ExprKind::Call {
@@ -605,21 +831,44 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
                 Expr { kind, span }
             });
 
-        // Unary prefix
-        let unary = choice((
+        // Reference expression: &expr or &mut expr
+        let ref_expr = just(TokenKind::And)
+            .ignore_then(keyword(Keyword::Mut).or_not().map(|m| m.is_some()))
+            .then(postfix.clone())
+            .map(|(mutable, expr)| Expr {
+                span: expr.span,
+                kind: ExprKind::Ref { mutable, expr: Box::new(expr) },
+            });
+
+        // Unary prefix: handles -, !, *, and falls back to ref_expr or postfix
+        let unary_op = choice((
             just(TokenKind::Minus).to(UnaryOp::Neg),
             just(TokenKind::Not).to(UnaryOp::Not),
             just(TokenKind::Star).to(UnaryOp::Deref),
-        ))
-        .repeated()
-        .then(postfix)
-        .foldr(|op, expr| Expr {
-            span: expr.span,
-            kind: ExprKind::Unary { op, expr: Box::new(expr) },
-        });
+        ));
+
+        let unary = unary_op.clone()
+            .repeated()
+            .then(ref_expr.or(postfix))
+            .foldr(|op, expr| Expr {
+                span: expr.span,
+                kind: ExprKind::Unary { op, expr: Box::new(expr) },
+            });
+
+        // Type cast: expr as Type
+        let cast = unary.clone()
+            .then(
+                keyword(Keyword::As)
+                    .ignore_then(ty.clone())
+                    .repeated()
+            )
+            .foldl(|expr, ty| Expr {
+                span: expr.span,
+                kind: ExprKind::Cast { expr: Box::new(expr), ty },
+            });
 
         // Binary operators with precedence
-        let product = unary.clone()
+        let product = cast.clone()
             .then(
                 choice((
                     just(TokenKind::Star).to(BinOp::Mul),
@@ -648,11 +897,16 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
                 kind: ExprKind::Binary { op, left: Box::new(a), right: Box::new(b) },
             });
 
+        // Handle >> as either Shr token or two consecutive Gt tokens
+        // (lexer may not combine them in generic contexts)
+        let shr_op = just(TokenKind::Shr).to(BinOp::Shr)
+            .or(just(TokenKind::Gt).ignore_then(just(TokenKind::Gt)).to(BinOp::Shr));
+
         let shift = sum.clone()
             .then(
                 choice((
                     just(TokenKind::Shl).to(BinOp::Shl),
-                    just(TokenKind::Shr).to(BinOp::Shr),
+                    shr_op,
                 ))
                 .then(sum.clone())
                 .repeated()
@@ -662,7 +916,43 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
                 kind: ExprKind::Binary { op, left: Box::new(a), right: Box::new(b) },
             });
 
-        let comparison = shift.clone()
+        // Bitwise AND: &
+        let bit_and = shift.clone()
+            .then(
+                just(TokenKind::And).to(BinOp::BitAnd)
+                    .then(shift.clone())
+                    .repeated()
+            )
+            .foldl(|a, (op, b)| Expr {
+                span: a.span.merge(b.span),
+                kind: ExprKind::Binary { op, left: Box::new(a), right: Box::new(b) },
+            });
+
+        // Bitwise XOR: ^
+        let bit_xor = bit_and.clone()
+            .then(
+                just(TokenKind::Caret).to(BinOp::BitXor)
+                    .then(bit_and.clone())
+                    .repeated()
+            )
+            .foldl(|a, (op, b)| Expr {
+                span: a.span.merge(b.span),
+                kind: ExprKind::Binary { op, left: Box::new(a), right: Box::new(b) },
+            });
+
+        // Bitwise OR: |
+        let bit_or = bit_xor.clone()
+            .then(
+                just(TokenKind::Or).to(BinOp::BitOr)
+                    .then(bit_xor.clone())
+                    .repeated()
+            )
+            .foldl(|a, (op, b)| Expr {
+                span: a.span.merge(b.span),
+                kind: ExprKind::Binary { op, left: Box::new(a), right: Box::new(b) },
+            });
+
+        let comparison = bit_or.clone()
             .then(
                 choice((
                     just(TokenKind::EqEq).to(BinOp::Eq),
@@ -672,7 +962,7 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
                     just(TokenKind::Gt).to(BinOp::Gt),
                     just(TokenKind::Ge).to(BinOp::Ge),
                 ))
-                .then(shift.clone())
+                .then(bit_or.clone())
                 .repeated()
             )
             .foldl(|a, (op, b)| Expr {
@@ -769,25 +1059,60 @@ fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
     })
 }
 
+fn expr_parser() -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
+    let ty = type_parser();
+    let pat = pattern_parser();
+    let simple_pat = simple_pattern_parser();
+    let balanced = balanced_tokens_parser();
+    expr_parser_with(ty, pat, simple_pat, balanced)
+}
+
 // ============================================================================
 // Block Parser
 // ============================================================================
 
-fn block_parser(expr: impl Parser<TokenKind, Expr, Error = ParseError> + Clone) -> impl Parser<TokenKind, Block, Error = ParseError> + Clone {
-    let stmt = stmt_parser(expr);
+fn block_parser(
+    expr: impl Parser<TokenKind, Expr, Error = ParseError> + Clone,
+    ty: impl Parser<TokenKind, Type, Error = ParseError> + Clone,
+    pat: impl Parser<TokenKind, Pattern, Error = ParseError> + Clone,
+) -> impl Parser<TokenKind, Block, Error = ParseError> + Clone {
+    let stmt = stmt_parser(expr, ty, pat);
 
     stmt.repeated()
         .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
         .map_with_span(|stmts, span| Block { stmts, span: span_from_range(span) })
 }
 
-fn stmt_parser(expr: impl Parser<TokenKind, Expr, Error = ParseError> + Clone) -> impl Parser<TokenKind, Stmt, Error = ParseError> + Clone {
+/// Convenience function: creates a complete block parser with all dependencies
+fn full_block_parser() -> impl Parser<TokenKind, Block, Error = ParseError> + Clone {
+    let ty = type_parser();
+    let pat = pattern_parser();
+    let simple_pat = simple_pattern_parser();
+    let balanced = balanced_tokens_parser();
+    let expr = expr_parser_with(ty.clone(), pat.clone(), simple_pat, balanced);
+    block_parser(expr, ty, pat)
+}
+
+fn stmt_parser(
+    expr: impl Parser<TokenKind, Expr, Error = ParseError> + Clone,
+    ty: impl Parser<TokenKind, Type, Error = ParseError> + Clone,
+    pat: impl Parser<TokenKind, Pattern, Error = ParseError> + Clone,
+) -> impl Parser<TokenKind, Stmt, Error = ParseError> + Clone {
     let let_stmt = keyword(Keyword::Let)
-        .ignore_then(pattern_parser())
-        .then(just(TokenKind::Colon).ignore_then(type_parser()).or_not())
+        .ignore_then(pat)
+        .then(just(TokenKind::Colon).ignore_then(ty).or_not())
         .then(just(TokenKind::Eq).ignore_then(expr.clone()).or_not())
         .then_ignore(just(TokenKind::Semi))
         .map(|((pat, ty), init)| StmtKind::Let { pat, ty, init });
+
+    // Local use statement: use path::to::thing;
+    let use_stmt = keyword(Keyword::Use)
+        .ignore_then(use_tree_parser())
+        .then_ignore(just(TokenKind::Semi))
+        .map_with_span(|tree, span| StmtKind::Item(Item {
+            kind: ItemKind::Use(Use { tree, is_pub: false }),
+            span: span_from_range(span),
+        }));
 
     let expr_stmt = expr.clone()
         .then(just(TokenKind::Semi).or_not())
@@ -804,6 +1129,7 @@ fn stmt_parser(expr: impl Parser<TokenKind, Expr, Error = ParseError> + Clone) -
 
     choice((
         let_stmt,
+        use_stmt,
         empty_stmt,
         expr_stmt,
     ))
@@ -814,22 +1140,61 @@ fn stmt_parser(expr: impl Parser<TokenKind, Expr, Error = ParseError> + Clone) -
 // Item Parser
 // ============================================================================
 
-fn item_parser() -> impl Parser<TokenKind, Item, Error = ParseError> + Clone {
-    recursive(|item| {
-        let visibility = keyword(Keyword::Pub).or_not().map(|p| p.is_some());
+// Parser for skipping attributes like #[derive(...)]
+fn skip_attributes() -> impl Parser<TokenKind, (), Error = ParseError> + Clone {
+    // #[ident(...)] or #[ident = ...]
+    // We use a simple approach: skip everything between #[ and ]
+    // Handle nested brackets by counting
+    let attr_content = none_of([TokenKind::RBracket])
+        .repeated()
+        .ignored();
+
+    just(TokenKind::Pound)
+        .ignore_then(just(TokenKind::LBracket))
+        .ignore_then(attr_content)
+        .ignore_then(just(TokenKind::RBracket))
+        .ignored()
+        .repeated()
+        .ignored()
+}
+
+fn item_parser_with(
+    ty: impl Parser<TokenKind, Type, Error = ParseError> + Clone + 'static,
+    pat: impl Parser<TokenKind, Pattern, Error = ParseError> + Clone + 'static,
+    block: impl Parser<TokenKind, Block, Error = ParseError> + Clone + 'static,
+    expr: impl Parser<TokenKind, Expr, Error = ParseError> + Clone + 'static,
+    balanced: impl Parser<TokenKind, (), Error = ParseError> + Clone + 'static,
+    param: impl Parser<TokenKind, Param, Error = ParseError> + Clone + 'static,
+    impl_item: impl Parser<TokenKind, ImplItem, Error = ParseError> + Clone + 'static,
+    trait_item: impl Parser<TokenKind, TraitItem, Error = ParseError> + Clone + 'static,
+) -> impl Parser<TokenKind, Item, Error = ParseError> + Clone {
+    recursive(move |item| {
+        let ty = ty.clone();
+        let block = block.clone();
+        let expr = expr.clone();
+        let balanced = balanced.clone();
+        let param = param.clone();
+        let impl_item = impl_item.clone();
+        let trait_item = trait_item.clone();
+        let pat = pat.clone();
+
+        // Skip any attributes before parsing the item
+        let attrs = skip_attributes();
+
+        let visibility = attrs.ignore_then(keyword(Keyword::Pub).or_not().map(|p| p.is_some()));
 
         let function = visibility.clone()
             .then_ignore(keyword(Keyword::Fn))
             .then(ident())
             .then(generics_parser())
             .then(
-                param_parser()
+                param.clone()
                     .separated_by(just(TokenKind::Comma))
                     .allow_trailing()
                     .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
             )
-            .then(just(TokenKind::Arrow).ignore_then(type_parser()).or_not())
-            .then(block_parser(expr_parser()).or_not())
+            .then(just(TokenKind::Arrow).ignore_then(ty.clone()).or_not())
+            .then(block.clone().or_not())
             .map(|(((((is_pub, name), generics), params), ret_type), body)| {
                 ItemKind::Function(Function {
                     name,
@@ -873,12 +1238,12 @@ fn item_parser() -> impl Parser<TokenKind, Item, Error = ParseError> + Clone {
                 ItemKind::Enum(Enum { name, generics, variants, is_pub })
             });
 
-        let impl_item = keyword(Keyword::Impl)
+        let impl_block = keyword(Keyword::Impl)
             .ignore_then(generics_parser())
             .then(path_parser().then_ignore(keyword(Keyword::For)).or_not())
-            .then(type_parser())
+            .then(ty.clone())
             .then(
-                impl_item_parser()
+                impl_item.clone()
                     .repeated()
                     .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
             )
@@ -886,12 +1251,12 @@ fn item_parser() -> impl Parser<TokenKind, Item, Error = ParseError> + Clone {
                 ItemKind::Impl(Impl { generics, trait_, self_ty, items })
             });
 
-        let trait_item = visibility.clone()
+        let trait_block = visibility.clone()
             .then_ignore(keyword(Keyword::Trait))
             .then(ident())
             .then(generics_parser())
             .then(
-                trait_item_parser()
+                trait_item.clone()
                     .repeated()
                     .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
             )
@@ -915,11 +1280,11 @@ fn item_parser() -> impl Parser<TokenKind, Item, Error = ParseError> + Clone {
             .then_ignore(keyword(Keyword::Const))
             .then(ident())
             .then_ignore(just(TokenKind::Colon))
-            .then(type_parser())
-            .then(just(TokenKind::Eq).ignore_then(expr_parser()).or_not())
+            .then(ty.clone())
+            .then(just(TokenKind::Eq).ignore_then(expr.clone()).or_not())
             .then_ignore(just(TokenKind::Semi))
-            .map(|(((is_pub, name), ty), value)| {
-                ItemKind::Const(Const { name, ty, value, is_pub })
+            .map(|(((is_pub, name), t), value)| {
+                ItemKind::Const(Const { name, ty: t, value, is_pub })
             });
 
         let static_item = visibility.clone()
@@ -927,11 +1292,11 @@ fn item_parser() -> impl Parser<TokenKind, Item, Error = ParseError> + Clone {
             .then(keyword(Keyword::Mut).or_not().map(|m| m.is_some()))
             .then(ident())
             .then_ignore(just(TokenKind::Colon))
-            .then(type_parser())
-            .then(just(TokenKind::Eq).ignore_then(expr_parser()).or_not())
+            .then(ty.clone())
+            .then(just(TokenKind::Eq).ignore_then(expr.clone()).or_not())
             .then_ignore(just(TokenKind::Semi))
-            .map(|((((is_pub, is_mut), name), ty), value)| {
-                ItemKind::Static(Static { name, ty, value, is_mut, is_pub })
+            .map(|((((is_pub, is_mut), name), t), value)| {
+                ItemKind::Static(Static { name, ty: t, value, is_mut, is_pub })
             });
 
         let mod_item = visibility.clone()
@@ -948,12 +1313,31 @@ fn item_parser() -> impl Parser<TokenKind, Item, Error = ParseError> + Clone {
                 ItemKind::Module(Module { name, items, is_pub })
             });
 
+        // macro_rules! name { ... } - skip the body (handles nested delimiters)
+        // Use pre-created balanced tokens parser
+        let macro_rules_item = just(TokenKind::Ident("macro_rules".to_string()))
+            .ignore_then(just(TokenKind::Not))
+            .ignore_then(ident())
+            .then(
+                just(TokenKind::LBrace)
+                    .ignore_then(balanced.clone().repeated())
+                    .then_ignore(just(TokenKind::RBrace))
+                    .or(just(TokenKind::LParen)
+                        .ignore_then(balanced.clone().repeated())
+                        .then_ignore(just(TokenKind::RParen)))
+            )
+            .map(|(name, _)| ItemKind::MacroRules(MacroRules {
+                name,
+                rules: vec![],
+            }));
+
         choice((
+            macro_rules_item,
             function,
             struct_item,
             enum_item,
-            impl_item,
-            trait_item,
+            impl_block,
+            trait_block,
             use_item,
             const_item,
             static_item,
@@ -973,6 +1357,19 @@ fn item_parser() -> impl Parser<TokenKind, Item, Error = ParseError> + Clone {
             TokenKind::Keyword(Keyword::Pub),
         ]))
     })
+}
+
+fn item_parser() -> impl Parser<TokenKind, Item, Error = ParseError> + Clone {
+    let ty = type_parser();
+    let pat = pattern_parser();
+    let simple_pat = simple_pattern_parser();
+    let balanced = balanced_tokens_parser();
+    let expr = expr_parser_with(ty.clone(), pat.clone(), simple_pat, balanced.clone());
+    let block = block_parser(expr.clone(), ty.clone(), pat.clone());
+    let param = param_parser_with(ty.clone(), pat.clone());
+    let impl_item = impl_item_parser_with(ty.clone(), block.clone(), param.clone());
+    let trait_item = trait_item_parser_with(ty.clone(), block.clone(), param.clone());
+    item_parser_with(ty, pat, block, expr, balanced, param, impl_item, trait_item)
 }
 
 fn self_type() -> Type {
@@ -1000,7 +1397,10 @@ fn self_pattern(mutable: bool, span: Span) -> Pattern {
     }
 }
 
-fn param_parser() -> impl Parser<TokenKind, Param, Error = ParseError> + Clone {
+fn param_parser_with(
+    ty: impl Parser<TokenKind, Type, Error = ParseError> + Clone,
+    pat: impl Parser<TokenKind, Pattern, Error = ParseError> + Clone,
+) -> impl Parser<TokenKind, Param, Error = ParseError> + Clone {
     // Self parameter variants: self, mut self, &self, &mut self
     let self_param = choice((
         // &mut self
@@ -1064,9 +1464,9 @@ fn param_parser() -> impl Parser<TokenKind, Param, Error = ParseError> + Clone {
     ));
 
     // Regular parameter: pattern: type
-    let regular_param = pattern_parser()
+    let regular_param = pat
         .then_ignore(just(TokenKind::Colon))
-        .then(type_parser())
+        .then(ty)
         .map_with_span(|(pattern, ty), span| Param {
             pattern,
             ty,
@@ -1074,6 +1474,10 @@ fn param_parser() -> impl Parser<TokenKind, Param, Error = ParseError> + Clone {
         });
 
     choice((self_param, regular_param))
+}
+
+fn param_parser() -> impl Parser<TokenKind, Param, Error = ParseError> + Clone {
+    param_parser_with(type_parser(), pattern_parser())
 }
 
 fn field_parser() -> impl Parser<TokenKind, Field, Error = ParseError> + Clone {
@@ -1139,19 +1543,25 @@ fn generics_parser() -> impl Parser<TokenKind, Generics, Error = ParseError> + C
         })
 }
 
-fn impl_item_parser() -> impl Parser<TokenKind, ImplItem, Error = ParseError> + Clone {
-    let function = keyword(Keyword::Fn)
-        .ignore_then(ident())
+fn impl_item_parser_with(
+    ty: impl Parser<TokenKind, Type, Error = ParseError> + Clone,
+    block: impl Parser<TokenKind, Block, Error = ParseError> + Clone,
+    param: impl Parser<TokenKind, Param, Error = ParseError> + Clone,
+) -> impl Parser<TokenKind, ImplItem, Error = ParseError> + Clone {
+    let function = skip_attributes()
+        .ignore_then(keyword(Keyword::Pub).or_not().map(|p| p.is_some()))
+        .then_ignore(keyword(Keyword::Fn))
+        .then(ident())
         .then(generics_parser())
         .then(
-            param_parser()
+            param
                 .separated_by(just(TokenKind::Comma))
                 .allow_trailing()
                 .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
         )
-        .then(just(TokenKind::Arrow).ignore_then(type_parser()).or_not())
-        .then(block_parser(expr_parser()))
-        .map(|((((name, generics), params), ret_type), body)| {
+        .then(just(TokenKind::Arrow).ignore_then(ty).or_not())
+        .then(block)
+        .map(|(((((is_pub, name), generics), params), ret_type), body)| {
             ImplItemKind::Function(Function {
                 name,
                 generics,
@@ -1160,26 +1570,35 @@ fn impl_item_parser() -> impl Parser<TokenKind, ImplItem, Error = ParseError> + 
                 body: Some(body),
                 is_async: false,
                 is_unsafe: false,
-                is_pub: false,
+                is_pub,
             })
         });
 
     function.map_with_span(|kind, span| ImplItem { kind, span: span_from_range(span) })
 }
 
-fn trait_item_parser() -> impl Parser<TokenKind, TraitItem, Error = ParseError> + Clone {
-    let function = keyword(Keyword::Fn)
+fn impl_item_parser() -> impl Parser<TokenKind, ImplItem, Error = ParseError> + Clone {
+    impl_item_parser_with(type_parser(), full_block_parser(), param_parser())
+}
+
+fn trait_item_parser_with(
+    ty: impl Parser<TokenKind, Type, Error = ParseError> + Clone,
+    block: impl Parser<TokenKind, Block, Error = ParseError> + Clone,
+    param: impl Parser<TokenKind, Param, Error = ParseError> + Clone,
+) -> impl Parser<TokenKind, TraitItem, Error = ParseError> + Clone {
+    let function = skip_attributes()
+        .ignore_then(keyword(Keyword::Fn))
         .ignore_then(ident())
         .then(generics_parser())
         .then(
-            param_parser()
+            param
                 .separated_by(just(TokenKind::Comma))
                 .allow_trailing()
                 .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
         )
-        .then(just(TokenKind::Arrow).ignore_then(type_parser()).or_not())
+        .then(just(TokenKind::Arrow).ignore_then(ty).or_not())
         .then(
-            block_parser(expr_parser()).map(Some)
+            block.map(Some)
                 .or(just(TokenKind::Semi).map(|_| None))
         )
         .map(|((((name, generics), params), ret_type), body)| {
@@ -1198,26 +1617,55 @@ fn trait_item_parser() -> impl Parser<TokenKind, TraitItem, Error = ParseError> 
     function.map_with_span(|kind, span| TraitItem { kind, span: span_from_range(span) })
 }
 
+fn trait_item_parser() -> impl Parser<TokenKind, TraitItem, Error = ParseError> + Clone {
+    trait_item_parser_with(type_parser(), full_block_parser(), param_parser())
+}
+
 fn use_tree_parser() -> impl Parser<TokenKind, UseTree, Error = ParseError> + Clone {
     recursive(|tree| {
         let path = path_parser();
 
+        // Parse: path (::* | ::{...} | as ident)?
         path.then(
-            just(TokenKind::PathSep)
-                .ignore_then(
-                    just(TokenKind::Star).map(|_| UseTree::Glob)
-                        .or(tree.clone()
+            choice((
+                // ::* (glob import)
+                just(TokenKind::PathSep)
+                    .ignore_then(just(TokenKind::Star))
+                    .map(|_| ("glob", None::<Ident>, Vec::new())),
+                // ::{...} (group import)
+                just(TokenKind::PathSep)
+                    .ignore_then(
+                        tree.clone()
                             .separated_by(just(TokenKind::Comma))
                             .allow_trailing()
                             .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
-                            .map(UseTree::Group))
-                )
-                .or_not()
+                    )
+                    .map(|items| ("group", None, items)),
+                // as ident (rename)
+                keyword(Keyword::As)
+                    .ignore_then(ident())
+                    .map(|alias| ("alias", Some(alias), Vec::new())),
+            ))
+            .or_not()
         )
-        .map(|(path, subtree)| {
-            match subtree {
-                Some(sub) => UseTree::Path(path, Some(Box::new(sub))),
-                None => UseTree::Path(path, None),
+        .map(|(path, suffix)| {
+            match suffix {
+                Some(("glob", _, _)) => UseTree::Path(path, Some(Box::new(UseTree::Glob))),
+                Some(("group", _, items)) => UseTree::Path(path, Some(Box::new(UseTree::Group(items)))),
+                Some(("alias", Some(alias), _)) => {
+                    // use foo::bar as baz -> Alias(bar, baz)
+                    let name = path.segments.last()
+                        .map(|s| s.ident.clone())
+                        .unwrap_or_else(|| Ident::new("".to_string(), Span::dummy()));
+                    UseTree::Path(
+                        Path {
+                            segments: path.segments[..path.segments.len().saturating_sub(1)].to_vec(),
+                            span: path.span,
+                        },
+                        Some(Box::new(UseTree::Alias(name, alias)))
+                    )
+                }
+                _ => UseTree::Path(path, None),
             }
         })
     })
@@ -1228,8 +1676,19 @@ fn use_tree_parser() -> impl Parser<TokenKind, UseTree, Error = ParseError> + Cl
 // ============================================================================
 
 fn source_file_parser() -> impl Parser<TokenKind, SourceFile, Error = ParseError> {
-    item_parser()
-        .repeated()
+    // Create all parsers ONCE at the top level to avoid nested construction
+    let ty = type_parser();
+    let pat = pattern_parser();
+    let simple_pat = simple_pattern_parser();
+    let balanced = balanced_tokens_parser();
+    let expr = expr_parser_with(ty.clone(), pat.clone(), simple_pat, balanced.clone());
+    let block = block_parser(expr.clone(), ty.clone(), pat.clone());
+    let param = param_parser_with(ty.clone(), pat.clone());
+    let impl_item = impl_item_parser_with(ty.clone(), block.clone(), param.clone());
+    let trait_item = trait_item_parser_with(ty.clone(), block.clone(), param.clone());
+    let item = item_parser_with(ty, pat, block, expr, balanced, param, impl_item, trait_item);
+
+    item.repeated()
         .then_ignore(end())
         .map_with_span(|items, span| SourceFile {
             items,
