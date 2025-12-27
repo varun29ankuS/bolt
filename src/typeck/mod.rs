@@ -620,28 +620,58 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             PatternKind::TupleStruct { path, elems } => {
-                // Similar to Struct but with positional fields
-                let type_name = path.segments.last().map(|s| s.ident.as_str()).unwrap_or("");
-                if let Some(struct_def) = self.ctx.registry.get_struct(type_name) {
-                    let type_args = if let Some(Ty::Adt { args, .. }) = self.ctx.registry.get(ty) {
-                        args
-                    } else {
-                        vec![]
-                    };
+                // Handle both tuple structs and enum variants
+                // For EnumName::Variant(x), path has 2 segments: [EnumName, Variant]
+                // For TupleStruct(x), path has 1 segment: [TupleStruct]
 
-                    let mut subst = HashMap::new();
-                    for (i, param) in struct_def.generics.params.iter().enumerate() {
-                        if let GenericParam::Type { name, .. } = param {
-                            if i < type_args.len() {
-                                subst.insert(name.clone(), type_args[i]);
+                let type_args = if let Some(Ty::Adt { args, .. }) = self.ctx.registry.get(ty) {
+                    args
+                } else {
+                    vec![]
+                };
+
+                if path.segments.len() >= 2 {
+                    // Likely an enum variant: EnumName::Variant
+                    let enum_name = path.segments[path.segments.len() - 2].ident.as_str();
+                    let variant_name = path.segments.last().map(|s| s.ident.as_str()).unwrap_or("");
+
+                    if let Some(enum_def) = self.ctx.registry.get_enum(enum_name) {
+                        let mut subst = HashMap::new();
+                        for (i, param) in enum_def.generics.params.iter().enumerate() {
+                            if let GenericParam::Type { name, .. } = param {
+                                if i < type_args.len() {
+                                    subst.insert(name.clone(), type_args[i]);
+                                }
+                            }
+                        }
+
+                        if let Some(variant) = enum_def.variants.iter().find(|v| v.name == variant_name) {
+                            for (i, elem_pat) in elems.iter().enumerate() {
+                                if let Some((_, field_ty)) = variant.fields.get(i) {
+                                    let resolved_ty = self.ctx.registry.resolve_hir_type_with_subst(field_ty, &subst);
+                                    self.bind_pattern(elem_pat, resolved_ty);
+                                }
                             }
                         }
                     }
+                } else {
+                    // Single segment - try as tuple struct
+                    let type_name = path.segments.last().map(|s| s.ident.as_str()).unwrap_or("");
+                    if let Some(struct_def) = self.ctx.registry.get_struct(type_name) {
+                        let mut subst = HashMap::new();
+                        for (i, param) in struct_def.generics.params.iter().enumerate() {
+                            if let GenericParam::Type { name, .. } = param {
+                                if i < type_args.len() {
+                                    subst.insert(name.clone(), type_args[i]);
+                                }
+                            }
+                        }
 
-                    for (i, elem_pat) in elems.iter().enumerate() {
-                        if let Some((_, field_ty)) = struct_def.fields.get(i) {
-                            let resolved_ty = self.ctx.registry.resolve_hir_type_with_subst(field_ty, &subst);
-                            self.bind_pattern(elem_pat, resolved_ty);
+                        for (i, elem_pat) in elems.iter().enumerate() {
+                            if let Some((_, field_ty)) = struct_def.fields.get(i) {
+                                let resolved_ty = self.ctx.registry.resolve_hir_type_with_subst(field_ty, &subst);
+                                self.bind_pattern(elem_pat, resolved_ty);
+                            }
                         }
                     }
                 }
@@ -1163,12 +1193,38 @@ impl<'a> TypeChecker<'a> {
             if let Some(enum_def) = self.ctx.registry.get_enum(type_name) {
                 for variant in &enum_def.variants {
                     if &variant.name == variant_name {
-                        // Return the enum type
-                        return Ok(self.ctx.registry.intern(Ty::Adt {
-                            def_id: enum_def.def_id,
-                            name: type_name.clone(),
-                            args: vec![],
-                        }));
+                        // Create fresh type variables for each generic parameter
+                        let mut type_args = Vec::new();
+                        let mut subst = HashMap::new();
+                        for param in &enum_def.generics.params {
+                            if let GenericParam::Type { name, .. } = param {
+                                let fresh = self.ctx.registry.fresh_infer();
+                                type_args.push(fresh);
+                                subst.insert(name.clone(), fresh);
+                            }
+                        }
+
+                        if variant.fields.is_empty() {
+                            // Unit variant - return the enum type directly
+                            return Ok(self.ctx.registry.intern(Ty::Adt {
+                                def_id: enum_def.def_id,
+                                name: type_name.clone(),
+                                args: type_args,
+                            }));
+                        } else {
+                            // Tuple variant - return a constructor function type
+                            let inputs: Vec<_> = variant.fields.iter()
+                                .map(|(_, field_ty)| {
+                                    self.ctx.registry.resolve_hir_type_with_subst(field_ty, &subst)
+                                })
+                                .collect();
+                            let output = self.ctx.registry.intern(Ty::Adt {
+                                def_id: enum_def.def_id,
+                                name: type_name.clone(),
+                                args: type_args,
+                            });
+                            return Ok(self.ctx.registry.intern(Ty::Fn { inputs, output }));
+                        }
                     }
                 }
             }

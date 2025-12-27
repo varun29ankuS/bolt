@@ -389,19 +389,53 @@ impl BorrowChecker {
             }
             ExprKind::If { cond, then_branch, else_branch } => {
                 self.check_expr(cond, ctx, UseKind::Read);
+
+                // Clone context before checking branches - only one branch executes
+                let ctx_before = ctx.clone();
                 self.check_block(then_branch, ctx);
+
                 if let Some(else_expr) = else_branch {
-                    self.check_expr(else_expr, ctx, UseKind::Read);
+                    // Check else branch with fresh context
+                    let mut else_ctx = ctx_before.clone();
+                    self.check_expr(else_expr, &mut else_ctx, UseKind::Read);
+                    // Merge: variable moved only if moved in BOTH branches
+                    ctx.merge_branches(&else_ctx);
+                } else {
+                    // No else branch - merge with original (then-only moves don't count)
+                    ctx.merge_branches(&ctx_before);
                 }
             }
             ExprKind::Match { expr: scrutinee, arms } => {
                 self.check_expr(scrutinee, ctx, UseKind::Read);
+
+                // Match arms are mutually exclusive - clone context for each
+                let ctx_before = ctx.clone();
+                let mut arm_contexts: Vec<BorrowContext> = Vec::new();
+
                 for arm in arms {
-                    self.bind_pattern(&arm.pattern, ctx, None);
+                    let mut arm_ctx = ctx_before.clone();
+                    self.bind_pattern(&arm.pattern, &mut arm_ctx, None);
                     if let Some(ref guard) = arm.guard {
-                        self.check_expr(guard, ctx, UseKind::Read);
+                        self.check_expr(guard, &mut arm_ctx, UseKind::Read);
                     }
-                    self.check_expr(&arm.body, ctx, UseKind::Read);
+                    self.check_expr(&arm.body, &mut arm_ctx, UseKind::Read);
+                    arm_contexts.push(arm_ctx);
+                }
+
+                // A variable is moved only if moved in ALL arms
+                for (name, info) in &mut ctx.locals {
+                    let moved_in_all = arm_contexts.iter().all(|arm_ctx| {
+                        arm_ctx.locals.get(name)
+                            .map(|i| matches!(i.state, PlaceState::Moved))
+                            .unwrap_or(false)
+                    });
+                    if !moved_in_all {
+                        // Not moved in all arms - restore to valid
+                        if matches!(info.state, PlaceState::Moved) {
+                            info.state = PlaceState::Valid;
+                            info.moved_span = None;
+                        }
+                    }
                 }
             }
             ExprKind::Loop { body, .. } => {
@@ -476,10 +510,39 @@ enum UseKind {
     MutBorrow,
 }
 
+#[derive(Clone)]
 struct BorrowContext {
     function_name: String,
     locals: IndexMap<String, LocalInfo>,
     scope_stack: Vec<Vec<String>>,
+}
+
+impl BorrowContext {
+    /// Merge two branch contexts: a variable is only considered moved
+    /// if it was moved in BOTH branches (since only one branch executes)
+    fn merge_branches(&mut self, other: &BorrowContext) {
+        for (name, info) in &mut self.locals {
+            if let Some(other_info) = other.locals.get(name) {
+                // Variable is moved only if moved in BOTH branches
+                match (&info.state, &other_info.state) {
+                    (PlaceState::Moved, PlaceState::Moved) => {
+                        // Both branches moved it - keep as moved
+                    }
+                    (PlaceState::Moved, _) => {
+                        // Only this branch moved it - restore to valid
+                        info.state = PlaceState::Valid;
+                        info.moved_span = None;
+                    }
+                    (_, PlaceState::Moved) => {
+                        // Only other branch moved it - keep as valid (already is)
+                    }
+                    _ => {
+                        // Neither moved it - keep current state
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

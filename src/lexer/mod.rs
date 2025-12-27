@@ -512,8 +512,37 @@ impl<'a> Lexer<'a> {
 pub fn cook_tokens(tokens: Vec<Token>) -> Vec<Token> {
     let mut result = Vec::with_capacity(tokens.len());
     let mut i = 0;
+    // Track generic angle bracket depth to avoid combining >> into Shr in generics
+    let mut angle_depth: i32 = 0;
 
     while i < tokens.len() {
+        let tok = &tokens[i];
+
+        // Track angle bracket depth for generic contexts
+        // Increment on < (but not << or <=), decrement on > (but not >> or >=)
+        match &tok.kind {
+            TokenKind::Lt => {
+                // Check if it's < followed by < or = (which would become << or <=)
+                let is_compound = i + 1 < tokens.len() &&
+                    tok.span.end == tokens[i + 1].span.start &&
+                    matches!(&tokens[i + 1].kind, TokenKind::Lt | TokenKind::Eq);
+                if !is_compound {
+                    angle_depth += 1;
+                }
+            }
+            TokenKind::Gt => {
+                // Check if it's > followed by > or = (which would become >> or >=)
+                let is_compound = i + 1 < tokens.len() &&
+                    tok.span.end == tokens[i + 1].span.start &&
+                    matches!(&tokens[i + 1].kind, TokenKind::Gt | TokenKind::Eq);
+                // Only decrement if NOT in a compound AND we're in angle brackets
+                if !is_compound && angle_depth > 0 {
+                    angle_depth -= 1;
+                }
+            }
+            _ => {}
+        }
+
         // Check for triple tokens first (..=, <<=, >>=)
         if i + 2 < tokens.len() {
             let t1 = &tokens[i];
@@ -525,7 +554,8 @@ pub fn cook_tokens(tokens: Vec<Token>) -> Vec<Token> {
                     (TokenKind::Dot, TokenKind::Dot, TokenKind::Eq) => Some(TokenKind::DotDotEq),
                     (TokenKind::Dot, TokenKind::Dot, TokenKind::Dot) => Some(TokenKind::Ellipsis),
                     (TokenKind::Lt, TokenKind::Lt, TokenKind::Eq) => Some(TokenKind::ShlEq),
-                    (TokenKind::Gt, TokenKind::Gt, TokenKind::Eq) => Some(TokenKind::ShrEq),
+                    // Only combine >>= when not inside generics
+                    (TokenKind::Gt, TokenKind::Gt, TokenKind::Eq) if angle_depth == 0 => Some(TokenKind::ShrEq),
                     _ => None,
                 };
 
@@ -555,7 +585,8 @@ pub fn cook_tokens(tokens: Vec<Token>) -> Vec<Token> {
                     (TokenKind::And, TokenKind::And) => Some(TokenKind::AndAnd),
                     (TokenKind::Or, TokenKind::Or) => Some(TokenKind::OrOr),
                     (TokenKind::Lt, TokenKind::Lt) => Some(TokenKind::Shl),
-                    (TokenKind::Gt, TokenKind::Gt) => Some(TokenKind::Shr),
+                    // Only combine >> when not inside generics
+                    (TokenKind::Gt, TokenKind::Gt) if angle_depth == 0 => Some(TokenKind::Shr),
                     (TokenKind::Dot, TokenKind::Dot) => Some(TokenKind::DotDot),
                     (TokenKind::Plus, TokenKind::Eq) => Some(TokenKind::PlusEq),
                     (TokenKind::Minus, TokenKind::Eq) => Some(TokenKind::MinusEq),
