@@ -168,11 +168,11 @@ fn type_parser() -> impl Parser<TokenKind, Type, Error = ParseError> + Clone {
             .map(|_| TypeKind::Infer);
 
         let impl_trait = keyword(Keyword::Impl)
-            .ignore_then(type_bounds())
+            .ignore_then(type_bounds_with(ty.clone()))
             .map(TypeKind::ImplTrait);
 
         let dyn_trait = keyword(Keyword::Dyn)
-            .ignore_then(type_bounds())
+            .ignore_then(type_bounds_with(ty.clone()))
             .map(TypeKind::DynTrait);
 
         // Function pointer type: fn(Type1, Type2) -> RetType
@@ -221,6 +221,46 @@ fn type_bounds() -> impl Parser<TokenKind, Vec<TypeBound>, Error = ParseError> +
         .at_least(1)
 }
 
+/// Type bounds with generic args support (for impl Trait, dyn Trait)
+fn type_bounds_with(
+    ty: impl Parser<TokenKind, Type, Error = ParseError> + Clone,
+) -> impl Parser<TokenKind, Vec<TypeBound>, Error = ParseError> + Clone {
+    // Generic args parser
+    let generic_args = ty
+        .separated_by(just(TokenKind::Comma))
+        .allow_trailing()
+        .delimited_by(just(TokenKind::Lt), just(TokenKind::Gt))
+        .map(|args| GenericArgs {
+            args: args.into_iter().map(GenericArg::Type).collect(),
+        });
+
+    // Path segment with optional generic args
+    let type_ident = choice((
+        keyword(Keyword::SelfType).map_with_span(|_, span| Ident::new("Self".to_string(), span_from_range(span))),
+        ident(),
+    ));
+
+    let segment = type_ident
+        .then(generic_args.or_not())
+        .map(|(ident, args)| PathSegment { ident, args });
+
+    // Full path with generics
+    let path_with_generics = segment
+        .separated_by(just(TokenKind::PathSep))
+        .at_least(1)
+        .map_with_span(|segments, span| Path {
+            segments,
+            span: span_from_range(span),
+        });
+
+    let trait_bound = path_with_generics.map(TypeBound::Trait);
+    let lifetime_bound = lifetime().map(TypeBound::Lifetime);
+
+    choice((trait_bound, lifetime_bound))
+        .separated_by(just(TokenKind::Plus))
+        .at_least(1)
+}
+
 // ============================================================================
 // Path Parser
 // ============================================================================
@@ -254,10 +294,9 @@ fn path_parser() -> impl Parser<TokenKind, Path, Error = ParseError> + Clone {
 // ============================================================================
 
 // Simple pattern parser for closure params (no or-patterns to avoid conflict with |)
-// Supports one level of tuple nesting which covers most closure parameter patterns
+// Uses recursion to support nested tuple patterns like (a, (b, c))
 fn simple_pattern_parser() -> impl Parser<TokenKind, Pattern, Error = ParseError> + Clone {
-    // Inner simple pattern (no tuples to avoid infinite recursion)
-    let inner_simple = {
+    recursive(|pat| {
         let wild = just(TokenKind::Underscore)
             .map(|_| PatternKind::Wild);
 
@@ -273,52 +312,30 @@ fn simple_pattern_parser() -> impl Parser<TokenKind, Pattern, Error = ParseError
                 subpat: None,
             });
 
+        let ref_pat = just(TokenKind::And)
+            .ignore_then(keyword(Keyword::Mut).or_not().map(|m| m.is_some()))
+            .then(pat.clone())
+            .map(|(mutable, inner)| PatternKind::Ref {
+                mutable,
+                inner: Box::new(inner),
+            });
+
+        // Tuple pattern with full nesting: (a, (b, c), _)
+        let tuple_pat = pat.clone()
+            .separated_by(just(TokenKind::Comma))
+            .allow_trailing()
+            .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
+            .map(PatternKind::Tuple);
+
         choice((
             wild,
+            ref_pat,
+            tuple_pat,
             lit_pat,
             ident_pat,
         ))
         .map_with_span(|kind, span| Pattern { kind, span: span_from_range(span) })
-    };
-
-    let wild = just(TokenKind::Underscore)
-        .map(|_| PatternKind::Wild);
-
-    let lit_pat = lit().map(PatternKind::Lit);
-
-    let ident_pat = keyword(Keyword::Ref).or_not()
-        .then(keyword(Keyword::Mut).or_not())
-        .then(ident())
-        .map(|((by_ref, mutable), name)| PatternKind::Ident {
-            by_ref: by_ref.is_some(),
-            mutable: mutable.is_some(),
-            name,
-            subpat: None,
-        });
-
-    let ref_pat = just(TokenKind::And)
-        .ignore_then(keyword(Keyword::Mut).or_not().map(|m| m.is_some()))
-        .then(inner_simple.clone())
-        .map(|(mutable, inner)| PatternKind::Ref {
-            mutable,
-            inner: Box::new(inner),
-        });
-
-    // Tuple pattern for closures: (a, b, _) - uses inner_simple to avoid recursion
-    let tuple_pat = inner_simple
-        .separated_by(just(TokenKind::Comma))
-        .allow_trailing()
-        .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
-        .map(PatternKind::Tuple);
-
-    choice((
-        wild,
-        ref_pat,
-        tuple_pat,
-        lit_pat,
-        ident_pat,
-    ))
-    .map_with_span(|kind, span| Pattern { kind, span: span_from_range(span) })
+    })
 }
 
 fn pattern_parser() -> impl Parser<TokenKind, Pattern, Error = ParseError> + Clone {
@@ -385,10 +402,15 @@ fn pattern_parser() -> impl Parser<TokenKind, Pattern, Error = ParseError> + Clo
             });
         let struct_pat = path_parser()
             .then(
+                // Fields with optional rest pattern (..)
+                // Handle: { }, { x }, { x, }, { x, .. }, { .. }
                 field_pat
                     .separated_by(just(TokenKind::Comma))
-                    .allow_trailing()
-                    .then(just(TokenKind::DotDot).or_not())
+                    .then(
+                        just(TokenKind::Comma).or_not()
+                            .ignore_then(just(TokenKind::DotDot))
+                            .or_not()
+                    )
                     .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
             )
             .map(|(path, (fields, rest))| PatternKind::Struct {
@@ -569,6 +591,267 @@ fn expr_parser_with(
             .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
             .map(|exprs| ExprKind::Array(ArrayExpr::List(exprs)));
 
+        // ========================================================================
+        // Condition expression parser (for if/while/for conditions)
+        // This is built BEFORE if_expr to break the circular dependency.
+        // It excludes struct literals at the top level to avoid ambiguity.
+        // ========================================================================
+
+        // Atoms usable in conditions (before control flow is defined)
+        let cond_atom = choice((
+            lit_expr.clone(),
+            self_expr.clone(),
+            macro_rules_expr.clone(),
+            macro_call.clone(),
+            path_expr.clone(),
+            tuple_expr.clone(),  // uses expr.clone() for nested - that's fine
+            array_expr.clone(),
+        ))
+        .map_with_span(|kind, span| Expr { kind, span: span_from_range(span) })
+        .boxed();
+
+        // Turbofish for conditions: ::<Type1, Type2>
+        let cond_turbofish = just(TokenKind::PathSep)
+            .ignore_then(
+                ty.clone()
+                    .separated_by(just(TokenKind::Comma))
+                    .allow_trailing()
+                    .delimited_by(just(TokenKind::Lt), just(TokenKind::Gt))
+            )
+            .map(|args| GenericArgs {
+                args: args.into_iter().map(GenericArg::Type).collect(),
+            });
+
+        // Postfix operations for conditions (without struct literals)
+        #[derive(Clone)]
+        enum CondPostfixOp {
+            Field(Ident),
+            MethodCall(Ident, Option<GenericArgs>, Vec<Expr>),
+            Call(Vec<Expr>),
+            Index(Expr),
+            Try,
+        }
+
+        let cond_postfix_op = choice((
+            // Method call or field access
+            just(TokenKind::Dot)
+                .ignore_then(
+                    ident()
+                        .or(select! { TokenKind::Int(n) => n }
+                            .map_with_span(|n, span| Ident::new(n.to_string(), span_from_range(span))))
+                )
+                .then(cond_turbofish.clone().or_not())
+                .then(
+                    expr.clone()
+                        .separated_by(just(TokenKind::Comma))
+                        .allow_trailing()
+                        .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
+                        .or_not()
+                )
+                .map(|((field, turbo), args)| {
+                    match args {
+                        Some(args) => CondPostfixOp::MethodCall(field, turbo, args),
+                        None if turbo.is_some() => CondPostfixOp::MethodCall(field, turbo, vec![]),
+                        None => CondPostfixOp::Field(field),
+                    }
+                }),
+            // Call: (args)
+            expr.clone()
+                .separated_by(just(TokenKind::Comma))
+                .allow_trailing()
+                .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
+                .map(CondPostfixOp::Call),
+            // Index: [expr]
+            expr.clone()
+                .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
+                .map(CondPostfixOp::Index),
+            // Try: ?
+            just(TokenKind::Question).to(CondPostfixOp::Try),
+        ));
+
+        let cond_postfix = cond_atom.clone()
+            .then(cond_postfix_op.repeated())
+            .foldl(|e: Expr, op: CondPostfixOp| -> Expr {
+                let span = e.span;
+                let kind = match op {
+                    CondPostfixOp::Field(field) => ExprKind::Field {
+                        expr: Box::new(e),
+                        field,
+                    },
+                    CondPostfixOp::MethodCall(method, turbofish, args) => ExprKind::MethodCall {
+                        receiver: Box::new(e),
+                        method,
+                        turbofish,
+                        args,
+                    },
+                    CondPostfixOp::Call(args) => ExprKind::Call {
+                        func: Box::new(e),
+                        args,
+                    },
+                    CondPostfixOp::Index(index) => ExprKind::Index {
+                        expr: Box::new(e),
+                        index: Box::new(index),
+                    },
+                    CondPostfixOp::Try => ExprKind::Try(Box::new(e)),
+                };
+                Expr { kind, span }
+            });
+
+        // Unary prefix for conditions
+        let cond_prefix_op = choice((
+            just(TokenKind::Minus).to(UnaryOp::Neg),
+            just(TokenKind::Not).to(UnaryOp::Not),
+            just(TokenKind::Star).to(UnaryOp::Deref),
+        ));
+
+        let cond_ref_op = just(TokenKind::And)
+            .ignore_then(keyword(Keyword::Mut).or_not().map(|m| m.is_some()));
+
+        // Build unary with foldr for right-associativity
+        let cond_unary = cond_prefix_op.clone()
+            .map(|op| (op, false))
+            .or(cond_ref_op.map(|mutable| (if mutable { UnaryOp::RefMut } else { UnaryOp::Ref }, true)))
+            .repeated()
+            .then(cond_postfix.clone())
+            .foldr(|(op, is_ref), expr: Expr| {
+                let span = expr.span;
+                let kind = if is_ref {
+                    ExprKind::Ref { mutable: op == UnaryOp::RefMut, expr: Box::new(expr) }
+                } else {
+                    ExprKind::Unary { op, expr: Box::new(expr) }
+                };
+                Expr { span, kind }
+            });
+
+        // Type cast for conditions
+        let cond_cast = cond_unary.clone()
+            .then(keyword(Keyword::As).ignore_then(ty.clone()).repeated())
+            .foldl(|expr, ty| Expr {
+                span: expr.span,
+                kind: ExprKind::Cast { expr: Box::new(expr), ty },
+            });
+
+        // Binary operators for conditions
+        let cond_product = cond_cast.clone()
+            .then(
+                choice((
+                    just(TokenKind::Star).to(BinOp::Mul),
+                    just(TokenKind::Slash).to(BinOp::Div),
+                    just(TokenKind::Percent).to(BinOp::Rem),
+                ))
+                .then(cond_cast.clone())
+                .repeated()
+            )
+            .foldl(|a, (op, b)| Expr {
+                span: a.span.merge(b.span),
+                kind: ExprKind::Binary { op, left: Box::new(a), right: Box::new(b) },
+            });
+
+        let cond_sum = cond_product.clone()
+            .then(
+                choice((
+                    just(TokenKind::Plus).to(BinOp::Add),
+                    just(TokenKind::Minus).to(BinOp::Sub),
+                ))
+                .then(cond_product.clone())
+                .repeated()
+            )
+            .foldl(|a, (op, b)| Expr {
+                span: a.span.merge(b.span),
+                kind: ExprKind::Binary { op, left: Box::new(a), right: Box::new(b) },
+            });
+
+        let cond_shift = cond_sum.clone()
+            .then(
+                choice((
+                    just(TokenKind::Shl).to(BinOp::Shl),
+                    just(TokenKind::Shr).to(BinOp::Shr),
+                ))
+                .then(cond_sum.clone())
+                .repeated()
+            )
+            .foldl(|a, (op, b)| Expr {
+                span: a.span.merge(b.span),
+                kind: ExprKind::Binary { op, left: Box::new(a), right: Box::new(b) },
+            });
+
+        let cond_bit_and = cond_shift.clone()
+            .then(
+                just(TokenKind::And).to(BinOp::BitAnd)
+                    .then(cond_shift.clone())
+                    .repeated()
+            )
+            .foldl(|a, (op, b)| Expr {
+                span: a.span.merge(b.span),
+                kind: ExprKind::Binary { op, left: Box::new(a), right: Box::new(b) },
+            });
+
+        let cond_bit_xor = cond_bit_and.clone()
+            .then(
+                just(TokenKind::Caret).to(BinOp::BitXor)
+                    .then(cond_bit_and.clone())
+                    .repeated()
+            )
+            .foldl(|a, (op, b)| Expr {
+                span: a.span.merge(b.span),
+                kind: ExprKind::Binary { op, left: Box::new(a), right: Box::new(b) },
+            });
+
+        let cond_bit_or = cond_bit_xor.clone()
+            .then(
+                just(TokenKind::Or).to(BinOp::BitOr)
+                    .then(cond_bit_xor.clone())
+                    .repeated()
+            )
+            .foldl(|a, (op, b)| Expr {
+                span: a.span.merge(b.span),
+                kind: ExprKind::Binary { op, left: Box::new(a), right: Box::new(b) },
+            });
+
+        let cond_comparison = cond_bit_or.clone()
+            .then(
+                choice((
+                    just(TokenKind::EqEq).to(BinOp::Eq),
+                    just(TokenKind::Ne).to(BinOp::Ne),
+                    just(TokenKind::Lt).to(BinOp::Lt),
+                    just(TokenKind::Le).to(BinOp::Le),
+                    just(TokenKind::Gt).to(BinOp::Gt),
+                    just(TokenKind::Ge).to(BinOp::Ge),
+                ))
+                .then(cond_bit_or.clone())
+                .repeated()
+            )
+            .foldl(|a, (op, b)| Expr {
+                span: a.span.merge(b.span),
+                kind: ExprKind::Binary { op, left: Box::new(a), right: Box::new(b) },
+            });
+
+        let cond_logical_and = cond_comparison.clone()
+            .then(
+                just(TokenKind::AndAnd).to(BinOp::And)
+                    .then(cond_comparison.clone())
+                    .repeated()
+            )
+            .foldl(|a, (op, b)| Expr {
+                span: a.span.merge(b.span),
+                kind: ExprKind::Binary { op, left: Box::new(a), right: Box::new(b) },
+            });
+
+        let cond_expr = cond_logical_and.clone()
+            .then(
+                just(TokenKind::OrOr).to(BinOp::Or)
+                    .then(cond_logical_and.clone())
+                    .repeated()
+            )
+            .foldl(|a, (op, b)| Expr {
+                span: a.span.merge(b.span),
+                kind: ExprKind::Binary { op, left: Box::new(a), right: Box::new(b) },
+            });
+
+        // ========================================================================
+        // End of condition expression parser
+        // ========================================================================
+
         // Let condition for if let / while let: let Pattern = expr
         let let_cond = keyword(Keyword::Let)
             .ignore_then(pat.clone())
@@ -580,7 +863,7 @@ fn expr_parser_with(
             });
 
         let if_expr = keyword(Keyword::If)
-            .ignore_then(let_cond.clone().or(expr.clone()))
+            .ignore_then(let_cond.clone().or(cond_expr.clone()))
             .then(block.clone())
             .then(keyword(Keyword::Else).ignore_then(
                 block.clone().map(|b| Expr { kind: ExprKind::Block(b), span: Span::dummy() })
@@ -593,7 +876,7 @@ fn expr_parser_with(
             });
 
         let match_arm = pat.clone()
-            .then(just(TokenKind::Keyword(Keyword::If)).ignore_then(expr.clone()).or_not())
+            .then(just(TokenKind::Keyword(Keyword::If)).ignore_then(cond_expr.clone()).or_not())
             .then_ignore(just(TokenKind::FatArrow))
             .then(expr.clone())
             .map_with_span(|((pattern, guard), body), span| MatchArm {
@@ -622,7 +905,7 @@ fn expr_parser_with(
             .map(|body| ExprKind::Loop { label: None, body });
 
         let while_expr = keyword(Keyword::While)
-            .ignore_then(let_cond.clone().or(expr.clone()))
+            .ignore_then(let_cond.clone().or(cond_expr.clone()))
             .then(block.clone())
             .map(|(cond, body)| ExprKind::While {
                 label: None,
@@ -633,7 +916,7 @@ fn expr_parser_with(
         let for_expr = keyword(Keyword::For)
             .ignore_then(pat.clone())
             .then_ignore(keyword(Keyword::In))
-            .then(expr.clone())
+            .then(cond_expr.clone())
             .then(block.clone())
             .map(|((pat, iter), body)| ExprKind::For {
                 label: None,
@@ -680,8 +963,28 @@ fn expr_parser_with(
             .ignore_then(block.clone())
             .map(ExprKind::Unsafe);
 
+        // Prefix range: ..expr, ..=expr, or just ..
+        // This needs to use expr recursively, so we wrap in the right way
+        let prefix_range = choice((
+            just(TokenKind::DotDotEq)
+                .ignore_then(expr.clone())
+                .map(|end| ExprKind::Range {
+                    start: None,
+                    end: Some(Box::new(end)),
+                    inclusive: true,
+                }),
+            just(TokenKind::DotDot)
+                .ignore_then(expr.clone().or_not())
+                .map(|end| ExprKind::Range {
+                    start: None,
+                    end: end.map(Box::new),
+                    inclusive: false,
+                }),
+        ));
+
         // Primary expression
         let atom = choice((
+            prefix_range,  // must come before other atoms
             lit_expr,
             if_expr,
             match_expr,
@@ -785,75 +1088,88 @@ fn expr_parser_with(
             just(TokenKind::Question).to(PostfixOp::Try),
         ));
 
+        // Helper to fold postfix operations
+        let fold_postfix = |e: Expr, op: PostfixOp| -> Expr {
+            let span = e.span;
+            let kind = match op {
+                PostfixOp::Field(field) => ExprKind::Field {
+                    expr: Box::new(e),
+                    field,
+                },
+                PostfixOp::MethodCall(method, turbofish, args) => ExprKind::MethodCall {
+                    receiver: Box::new(e),
+                    method,
+                    turbofish,
+                    args,
+                },
+                PostfixOp::Call(args) => ExprKind::Call {
+                    func: Box::new(e),
+                    args,
+                },
+                PostfixOp::Index(index) => ExprKind::Index {
+                    expr: Box::new(e),
+                    index: Box::new(index),
+                },
+                PostfixOp::Try => ExprKind::Try(Box::new(e)),
+                PostfixOp::StructLit(fields) => {
+                    // The previous expr should be a path for the struct name
+                    if let ExprKind::Path(path) = e.kind {
+                        ExprKind::Struct { path, fields, rest: None }
+                    } else {
+                        // Invalid: non-path followed by struct literal
+                        ExprKind::Struct {
+                            path: Path {
+                                segments: vec![],
+                                span: e.span,
+                            },
+                            fields,
+                            rest: None,
+                        }
+                    }
+                }
+            };
+            Expr { kind, span }
+        };
+
         // Postfix: calls, fields, indexing, struct literals
         let postfix = atom.clone()
             .then(postfix_op.repeated())
-            .foldl(|e, op| {
-                let span = e.span;
-                let kind = match op {
-                    PostfixOp::Field(field) => ExprKind::Field {
-                        expr: Box::new(e),
-                        field,
-                    },
-                    PostfixOp::MethodCall(method, turbofish, args) => ExprKind::MethodCall {
-                        receiver: Box::new(e),
-                        method,
-                        turbofish,
-                        args,
-                    },
-                    PostfixOp::Call(args) => ExprKind::Call {
-                        func: Box::new(e),
-                        args,
-                    },
-                    PostfixOp::Index(index) => ExprKind::Index {
-                        expr: Box::new(e),
-                        index: Box::new(index),
-                    },
-                    PostfixOp::Try => ExprKind::Try(Box::new(e)),
-                    PostfixOp::StructLit(fields) => {
-                        // The previous expr should be a path for the struct name
-                        if let ExprKind::Path(path) = e.kind {
-                            ExprKind::Struct { path, fields, rest: None }
-                        } else {
-                            // Invalid: non-path followed by struct literal
-                            // Just return the fields as struct with dummy path
-                            ExprKind::Struct {
-                                path: Path {
-                                    segments: vec![],
-                                    span: e.span,
-                                },
-                                fields,
-                                rest: None,
-                            }
-                        }
-                    }
-                };
-                Expr { kind, span }
-            });
+            .foldl(fold_postfix);
 
-        // Reference expression: &expr or &mut expr
-        let ref_expr = just(TokenKind::And)
-            .ignore_then(keyword(Keyword::Mut).or_not().map(|m| m.is_some()))
-            .then(postfix.clone())
-            .map(|(mutable, expr)| Expr {
-                span: expr.span,
-                kind: ExprKind::Ref { mutable, expr: Box::new(expr) },
-            });
+        // Unary prefix: handles -, !, *, and & (with optional mut)
+        #[derive(Clone)]
+        enum PrefixOp {
+            Neg,
+            Not,
+            Deref,
+            Ref(bool), // bool = mutable
+        }
 
-        // Unary prefix: handles -, !, *, and falls back to ref_expr or postfix
-        let unary_op = choice((
-            just(TokenKind::Minus).to(UnaryOp::Neg),
-            just(TokenKind::Not).to(UnaryOp::Not),
-            just(TokenKind::Star).to(UnaryOp::Deref),
+        let prefix_op = choice((
+            just(TokenKind::Minus).to(PrefixOp::Neg),
+            just(TokenKind::Not).to(PrefixOp::Not),
+            just(TokenKind::Star).to(PrefixOp::Deref),
+            just(TokenKind::And)
+                .ignore_then(keyword(Keyword::Mut).or_not().map(|m| m.is_some()))
+                .map(PrefixOp::Ref),
         ));
 
-        let unary = unary_op.clone()
+        // Helper for unary foldr
+        let fold_unary = |op: PrefixOp, expr: Expr| -> Expr {
+            let span = expr.span;
+            let kind = match op {
+                PrefixOp::Neg => ExprKind::Unary { op: UnaryOp::Neg, expr: Box::new(expr) },
+                PrefixOp::Not => ExprKind::Unary { op: UnaryOp::Not, expr: Box::new(expr) },
+                PrefixOp::Deref => ExprKind::Unary { op: UnaryOp::Deref, expr: Box::new(expr) },
+                PrefixOp::Ref(mutable) => ExprKind::Ref { mutable, expr: Box::new(expr) },
+            };
+            Expr { span, kind }
+        };
+
+        let unary = prefix_op.clone()
             .repeated()
-            .then(ref_expr.or(postfix))
-            .foldr(|op, expr| Expr {
-                span: expr.span,
-                kind: ExprKind::Unary { op, expr: Box::new(expr) },
-            });
+            .then(postfix.clone())
+            .foldr(fold_unary);
 
         // Type cast: expr as Type
         let cast = unary.clone()
@@ -875,7 +1191,7 @@ fn expr_parser_with(
                     just(TokenKind::Slash).to(BinOp::Div),
                     just(TokenKind::Percent).to(BinOp::Rem),
                 ))
-                .then(unary.clone())
+                .then(cast.clone())
                 .repeated()
             )
             .foldl(|a, (op, b)| Expr {
@@ -1030,6 +1346,12 @@ fn expr_parser_with(
                     just(TokenKind::MinusEq).to(Some(BinOp::Sub)),
                     just(TokenKind::StarEq).to(Some(BinOp::Mul)),
                     just(TokenKind::SlashEq).to(Some(BinOp::Div)),
+                    just(TokenKind::PercentEq).to(Some(BinOp::Rem)),
+                    just(TokenKind::CaretEq).to(Some(BinOp::BitXor)),
+                    just(TokenKind::OrEq).to(Some(BinOp::BitOr)),
+                    just(TokenKind::AndEq).to(Some(BinOp::BitAnd)),
+                    just(TokenKind::ShlEq).to(Some(BinOp::Shl)),
+                    just(TokenKind::ShrEq).to(Some(BinOp::Shr)),
                 ))
                 .then(range.clone())
                 .or_not()
@@ -1100,7 +1422,7 @@ fn stmt_parser(
 ) -> impl Parser<TokenKind, Stmt, Error = ParseError> + Clone {
     let let_stmt = keyword(Keyword::Let)
         .ignore_then(pat)
-        .then(just(TokenKind::Colon).ignore_then(ty).or_not())
+        .then(just(TokenKind::Colon).ignore_then(ty.clone()).or_not())
         .then(just(TokenKind::Eq).ignore_then(expr.clone()).or_not())
         .then_ignore(just(TokenKind::Semi))
         .map(|((pat, ty), init)| StmtKind::Let { pat, ty, init });
@@ -1111,6 +1433,18 @@ fn stmt_parser(
         .then_ignore(just(TokenKind::Semi))
         .map_with_span(|tree, span| StmtKind::Item(Item {
             kind: ItemKind::Use(Use { tree, is_pub: false }),
+            span: span_from_range(span),
+        }));
+
+    // Local const: const NAME: Type = value;
+    let const_stmt = keyword(Keyword::Const)
+        .ignore_then(ident())
+        .then_ignore(just(TokenKind::Colon))
+        .then(ty.clone())
+        .then(just(TokenKind::Eq).ignore_then(expr.clone()).or_not())
+        .then_ignore(just(TokenKind::Semi))
+        .map_with_span(|((name, ty), value), span| StmtKind::Item(Item {
+            kind: ItemKind::Const(Const { name, ty, value, is_pub: false }),
             span: span_from_range(span),
         }));
 
@@ -1130,6 +1464,7 @@ fn stmt_parser(
     choice((
         let_stmt,
         use_stmt,
+        const_stmt,
         empty_stmt,
         expr_stmt,
     ))
@@ -1183,7 +1518,15 @@ fn item_parser_with(
 
         let visibility = attrs.ignore_then(keyword(Keyword::Pub).or_not().map(|p| p.is_some()));
 
+        // Function modifiers: unsafe and/or extern "C"
+        let unsafe_modifier = keyword(Keyword::Unsafe).or_not().map(|u| u.is_some());
+        let abi_specifier = keyword(Keyword::Extern)
+            .ignore_then(select! { TokenKind::Str(s) => s }.or_not())
+            .or_not();
+
         let function = visibility.clone()
+            .then(unsafe_modifier)
+            .then(abi_specifier)
             .then_ignore(keyword(Keyword::Fn))
             .then(ident())
             .then(generics_parser())
@@ -1195,7 +1538,7 @@ fn item_parser_with(
             )
             .then(just(TokenKind::Arrow).ignore_then(ty.clone()).or_not())
             .then(block.clone().or_not())
-            .map(|(((((is_pub, name), generics), params), ret_type), body)| {
+            .map(|(((((((is_pub, is_unsafe), _abi), name), generics), params), ret_type), body)| {
                 ItemKind::Function(Function {
                     name,
                     generics,
@@ -1203,21 +1546,38 @@ fn item_parser_with(
                     ret_type,
                     body,
                     is_async: false,
-                    is_unsafe: false,
+                    is_unsafe,
                     is_pub,
                 })
             });
+
+        // Tuple struct field: #[attr] pub Type or just Type
+        let tuple_field = skip_attributes()
+            .ignore_then(visibility.clone())
+            .then(ty.clone())
+            .map(|(is_pub, ty)| (is_pub, ty));
 
         let struct_item = visibility.clone()
             .then_ignore(keyword(Keyword::Struct))
             .then(ident())
             .then(generics_parser())
             .then(
+                // Named struct: { field: Type, ... }
                 field_parser()
                     .separated_by(just(TokenKind::Comma))
                     .allow_trailing()
                     .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
                     .map(StructFields::Named)
+                // Tuple struct: (Type, Type, ...);
+                .or(
+                    tuple_field
+                        .separated_by(just(TokenKind::Comma))
+                        .allow_trailing()
+                        .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
+                        .then_ignore(just(TokenKind::Semi))
+                        .map(|fields| StructFields::Tuple(fields.into_iter().map(|(_, ty)| ty).collect()))
+                )
+                // Unit struct: ;
                 .or(just(TokenKind::Semi).map(|_| StructFields::Unit))
             )
             .map(|(((is_pub, name), generics), fields)| {
@@ -1299,6 +1659,17 @@ fn item_parser_with(
                 ItemKind::Static(Static { name, ty: t, value, is_mut, is_pub })
             });
 
+        // Type alias: type Name = Type;
+        let type_alias = visibility.clone()
+            .then_ignore(keyword(Keyword::Type))
+            .then(ident())
+            .then(generics_parser())
+            .then(just(TokenKind::Eq).ignore_then(ty.clone()).or_not())
+            .then_ignore(just(TokenKind::Semi))
+            .map(|(((is_pub, name), generics), ty)| {
+                ItemKind::TypeAlias(TypeAlias { name, generics, ty, is_pub })
+            });
+
         let mod_item = visibility.clone()
             .then_ignore(keyword(Keyword::Mod))
             .then(ident())
@@ -1331,8 +1702,24 @@ fn item_parser_with(
                 rules: vec![],
             }));
 
+        // extern "C" { fn declarations } - skip the body for now
+        let extern_block = keyword(Keyword::Extern)
+            .ignore_then(
+                select! { TokenKind::Str(s) => s }.or_not()
+            )
+            .then(
+                just(TokenKind::LBrace)
+                    .ignore_then(balanced.clone().repeated())
+                    .then_ignore(just(TokenKind::RBrace))
+            )
+            .map(|(abi, _)| ItemKind::ExternBlock(ExternBlock {
+                abi,
+                items: vec![],
+            }));
+
         choice((
             macro_rules_item,
+            extern_block,
             function,
             struct_item,
             enum_item,
@@ -1341,6 +1728,7 @@ fn item_parser_with(
             use_item,
             const_item,
             static_item,
+            type_alias,
             mod_item,
         ))
         .map_with_span(|kind, span| Item { kind, span: span_from_range(span) })
@@ -1353,6 +1741,8 @@ fn item_parser_with(
             TokenKind::Keyword(Keyword::Use),
             TokenKind::Keyword(Keyword::Const),
             TokenKind::Keyword(Keyword::Static),
+            TokenKind::Keyword(Keyword::Type),
+            TokenKind::Keyword(Keyword::Extern),
             TokenKind::Keyword(Keyword::Mod),
             TokenKind::Keyword(Keyword::Pub),
         ]))
@@ -1481,7 +1871,9 @@ fn param_parser() -> impl Parser<TokenKind, Param, Error = ParseError> + Clone {
 }
 
 fn field_parser() -> impl Parser<TokenKind, Field, Error = ParseError> + Clone {
-    keyword(Keyword::Pub).or_not()
+    // Skip field attributes like #[serde(...)]
+    skip_attributes()
+        .ignore_then(keyword(Keyword::Pub).or_not())
         .then(ident())
         .then_ignore(just(TokenKind::Colon))
         .then(type_parser())
@@ -1494,7 +1886,9 @@ fn field_parser() -> impl Parser<TokenKind, Field, Error = ParseError> + Clone {
 }
 
 fn variant_parser() -> impl Parser<TokenKind, Variant, Error = ParseError> + Clone {
-    ident()
+    // Skip variant attributes like #[error(...)]
+    skip_attributes()
+        .ignore_then(ident())
         .then(
             field_parser()
                 .separated_by(just(TokenKind::Comma))
@@ -1502,7 +1896,9 @@ fn variant_parser() -> impl Parser<TokenKind, Variant, Error = ParseError> + Clo
                 .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
                 .map(StructFields::Named)
             .or(
-                type_parser()
+                // Tuple variant fields can have attributes like #[from]
+                skip_attributes()
+                    .ignore_then(type_parser())
                     .separated_by(just(TokenKind::Comma))
                     .allow_trailing()
                     .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
