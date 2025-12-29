@@ -43,6 +43,8 @@ pub enum ItemKind {
     Use(Use),
     /// macro_rules! name { rules }
     MacroRules(MacroRules),
+    /// extern "C" { functions }
+    ExternBlock(ExternBlock),
 }
 
 /// Function definition
@@ -210,6 +212,22 @@ pub struct MacroRules {
     pub rules: Vec<MacroRule>,
 }
 
+/// extern "C" { fn declarations }
+#[derive(Debug, Clone)]
+pub struct ExternBlock {
+    pub abi: Option<String>,
+    pub items: Vec<ExternItem>,
+}
+
+/// Item inside extern block
+#[derive(Debug, Clone)]
+pub struct ExternItem {
+    pub name: Ident,
+    pub params: Vec<Type>,
+    pub ret_type: Option<Type>,
+    pub is_pub: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct MacroRule {
     pub pattern: Vec<MacroToken>,
@@ -317,6 +335,8 @@ pub enum GenericArg {
     Type(Type),
     Lifetime(Ident),
     Const(Expr),
+    /// Associated type binding: `Error = MyError` in `Trait<Error = MyError>`
+    Binding(Ident, Type),
 }
 
 /// Patterns

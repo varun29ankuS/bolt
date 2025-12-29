@@ -1,22 +1,33 @@
-# Bolt
+# Bolt ⚡
 
-**Lightning-fast Rust compiler for development.**
+**A fast Rust compiler for rapid development iteration.**
 
-Bolt is an experimental Rust compiler that prioritizes iteration speed over production optimization. It compiles and runs Rust code **100-200x faster** than `rustc`/`cargo` by using Cranelift JIT instead of LLVM, with a vision for **async safety checking** and **expression-level incremental compilation**.
+Bolt compiles Rust code 10-15x faster than rustc by using Cranelift JIT instead of LLVM. It's designed for the development inner loop—not as a rustc replacement, but as a complement to it.
+
+```
+Development:  bolt check src/lib.rs     → 172ms
+Production:   cargo build --release     → use rustc
+```
+
+## Why Bolt?
+
+**The problem**: `cargo check` takes 2+ minutes on medium projects. That's too slow for rapid iteration.
+
+**The solution**: A lightweight compiler optimized for development speed. Bolt handles ~70% of Rust syntax—enough for most iteration cycles. When you hit an edge case, it suggests falling back to rustc.
+
+```
+Error: Use of moved value: `x`
+
+  💡 Bolt couldn't handle this. Try: rustc --edition 2021 src/lib.rs
+```
 
 ## Benchmarks
 
-| Compiler | Time | Notes |
-|----------|------|-------|
-| **Bolt** | **~1.2ms** | Parse + Type Check + JIT + Execute |
-| rustc | ~200ms | Compile only |
-| cargo (cold) | ~400ms | Full build |
-| cargo (incremental) | ~110ms | No changes |
-
-```
-Bolt:  ████ 1.2ms
-rustc: ████████████████████████████████████████████████████████████████████████████████ 200ms
-```
+| File | Bolt | rustc | Speedup |
+|------|------|-------|---------|
+| 20 lines | 18ms | 186ms | **10x** |
+| 80 lines | 26ms | 285ms | **11x** |
+| 2300 lines | 172ms | - | - |
 
 ## Installation
 
@@ -24,182 +35,101 @@ rustc: ████████████████████████�
 git clone https://github.com/varun29ankuS/bolt.git
 cd bolt
 cargo build --release
-./target/release/bolt run your_file.rs
 ```
 
 ## Usage
 
 ```bash
-bolt run main.rs              # Compile + execute
-bolt check main.rs            # Check for errors (no codegen)
-bolt build main.rs            # Build without running
-bolt check main.rs -f json    # LLM-friendly JSON output
-bolt cache stats              # Cache statistics
+bolt run main.rs              # Compile and execute
+bolt check main.rs            # Type check only
+bolt check main.rs -f json    # JSON output (for tooling)
 ```
 
-## Vision & Architecture
+### JSON Output
 
-Bolt isn't just "rustc but faster" - it rethinks the compilation model for development iteration.
+For editor integrations and automated tooling:
 
-### Core Innovations
-
+```bash
+$ bolt check file.rs -f json
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           BOLT ARCHITECTURE                                  │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │                        FAST PATH (~1ms)                             │   │
-│   │                                                                     │   │
-│   │   Source ──▶ Parse ──▶ HIR ──▶ TypeCheck ──▶ Codegen ──▶ Execute   │   │
-│   │                         │                       │                   │   │
-│   └─────────────────────────┼───────────────────────┼───────────────────┘   │
-│                             │                       │                       │
-│   ┌─────────────────────────▼───────────────────────▼───────────────────┐   │
-│   │                    BACKGROUND (async)                               │   │
-│   │                                                                     │   │
-│   │   ┌──────────────┐    ┌─────────────────┐    ┌──────────────────┐   │   │
-│   │   │  BorrowCheck │    │  Speculative    │    │   Cache/mmap     │   │   │
-│   │   │  (eventual)  │    │  Monomorph      │    │   IR fragments   │   │   │
-│   │   └──────────────┘    └─────────────────┘    └──────────────────┘   │   │
-│   │         │                                                           │   │
-│   │         ▼                                                           │   │
-│   │   Warnings surface async (next compile blocks if unsafe)            │   │
-│   │                                                                     │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │                    PERSISTENT CACHE                                 │   │
-│   │                                                                     │   │
-│   │   ┌────────────────┐  ┌────────────────┐  ┌─────────────────────┐   │   │
-│   │   │ Expression IR  │  │ Mono instances │  │ mmap'd HIR (skip    │   │   │
-│   │   │ fragments      │  │ Vec<i32>, etc  │  │ parsing entirely)   │   │   │
-│   │   └────────────────┘  └────────────────┘  └─────────────────────┘   │   │
-│   │                                                                     │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### 1. Compile First, Verify Later
-
-Traditional: `Parse → Type → Borrow → Codegen → Run` (all blocking)
-
-Bolt vision:
-```
-Parse → Type → Codegen → Run     [~1ms, you see results]
-         └──▶ BorrowCheck        [async, warns if unsafe]
-```
-
-Code runs **immediately**. If borrow checker finds issues, they surface as warnings. Next compilation blocks only if previous check failed.
-
-### 2. Expression-Level Incremental Compilation
-
-rustc's incremental is function-level. Bolt aims for **expression-level**:
-
-```rust
-fn complex() -> i64 {
-    let a = expensive_op1();  // cached ✓
-    let b = expensive_op2();  // cached ✓
-    let c = a + b;            // CHANGED → recompile only this
-    let d = more_work(c);     // depends on c → recompile
-    d
+```json
+{
+  "diagnostics": [
+    {"level": "error", "code": "type_mismatch", "message": "Expected i64, found String"}
+  ],
+  "summary": {"errors": 1, "warnings": 0}
 }
 ```
 
-Each expression hashed by AST + dependencies. Only recompile what changed.
+## What's Supported
 
-### 3. Speculative Monomorphization
+**Working:**
+- Functions, structs, enums, generics
+- Pattern matching, closures, impl blocks
+- Type inference, monomorphization
+- Basic borrow checking
+- `use`, `Result<T,E>`, `?` operator
 
-Pre-compile common generic instantiations before they're needed:
+**Limitations:**
+- No trait bounds (impl blocks work, trait constraints don't)
+- No async/await
+- No procedural macros
+- Some complex type inference patterns
 
-```
-Background thread profiles usage:
-  Vec<i32>     → pre-compiled ✓
-  Option<String> → pre-compiled ✓
-  HashMap<K,V> → ready when you need it
-```
-
-When your code calls `Vec::new()`, the compiled version is already waiting.
-
-### 4. Memory-Mapped IR
-
-Skip parsing entirely for unchanged files:
+## Architecture
 
 ```
-Traditional: Load → Parse → Typecheck → Codegen  [2ms]
-With mmap:   mmap cached HIR → Codegen           [0.05ms]
+Source → Lexer → Parser → HIR → TypeCheck → BorrowCheck → Codegen (Cranelift) → Execute
+                   │
+                   ├── syn-based (stable)
+                   └── Chumsky-based (experimental, faster)
 ```
 
-Persist compiled IR to disk. Memory-map it back. Zero deserialization.
+~20,000 lines of Rust. Clean pipeline, no magic.
 
-## Current Status
+## Roadmap
 
-### Implemented ✓
+### Vision
 
-- **Core Language**: Functions, structs, enums, generics, pattern matching, closures
-- **Type System**: Full inference, unified TypeRegistry, monomorphization
-- **LLM Diagnostics**: JSON output with error codes, suggestions, confidence levels
-- **Syntax**: `use`, `Result<T,E>`, `?` operator, `#[derive(...)]`
+Bolt aims to be the **development compiler** for Rust—optimizing for iteration speed over production performance. The goal is sub-100ms feedback for most changes.
 
-### In Progress
+### Milestones
 
-- Trait method resolution
-- Expression type tracking for codegen
+| Phase | Goal | Status |
+|-------|------|--------|
+| **v0.1** | Core language subset, 10x speedup | ✅ Done |
+| **v0.2** | Self-hosting (parse own source) | ✅ Done (16/16 files) |
+| **v0.3** | Self-hosting (compile own source) | 🔧 In progress (10/16 files) |
+| **v0.4** | Trait bounds, better type inference | Planned |
+| **v0.5** | Async borrow checking | Planned |
+| **v1.0** | Stable API, editor integrations | Planned |
 
-### Roadmap
+### Future Ideas
 
-| Stage | Feature | Impact |
-|-------|---------|--------|
-| **Now** | Trait methods, lifetimes | Core language completeness |
-| **Next** | Async borrow checker | Instant feedback, safety async |
-| **Then** | Expression-level incremental | Sub-millisecond warm compiles |
-| **Later** | Memory-mapped IR | 0.05ms startup |
-| **Goal** | Self-hosting (BOL-44) | Bolt compiles Bolt |
-
-## Success Metrics
-
-| Metric | Current | Target |
-|--------|---------|--------|
-| Cold compile | ~1.2ms | <5ms |
-| Warm compile | ~1.2ms | <0.5ms (expression-level) |
-| Startup (cached) | ~1ms | <0.1ms (mmap) |
-| Rust coverage | ~40% | 80% (self-hosting) |
+- **Expression-level incremental compilation**: Only recompile changed expressions, not whole functions
+- **Memory-mapped IR**: Skip parsing for unchanged files entirely
+- **Speculative monomorphization**: Pre-compile common generic instantiations (`Vec<i32>`, etc.)
 
 ## Project Structure
 
 ```
 bolt/
 ├── src/
-│   ├── cli/mod.rs        # CLI with JSON output support
-│   ├── parser/           # syn-based parser + HIR lowering
-│   ├── hir.rs            # High-level IR
-│   ├── ty/mod.rs         # Unified type system (shared typeck↔codegen)
-│   ├── typeck/mod.rs     # Type inference and checking
-│   ├── borrowck/mod.rs   # Borrow checking (to become async)
-│   ├── codegen/mod.rs    # Cranelift JIT
-│   ├── cache/mod.rs      # Compilation caching
-│   └── error.rs          # LLM-friendly diagnostics
-└── test/                 # Test programs
+│   ├── lexer/       # Tokenization
+│   ├── parser/      # syn-based parser
+│   ├── parser2/     # Chumsky parser (experimental)
+│   ├── hir.rs       # High-level IR
+│   ├── ty/          # Type system
+│   ├── typeck/      # Type inference
+│   ├── borrowck/    # Borrow checking
+│   ├── codegen/     # Cranelift backend
+│   └── cli/         # Command-line interface
+└── examples/        # Example programs
 ```
 
-## Why Bolt?
+## Contributing
 
-| | rustc | Bolt |
-|---|---|---|
-| **Philosophy** | Correctness first | Speed first, correctness async |
-| **Backend** | LLVM (optimal, slow) | Cranelift (good, fast) |
-| **Incremental** | Function-level | Expression-level (planned) |
-| **Safety check** | Blocking | Async (planned) |
-| **Target** | Production | Development |
-
-Bolt is your development compiler. rustc is your release compiler.
-
-## Links
-
-- [Linear Project](https://linear.app/shodh-memory/project/bolt) - Issues and roadmap
-- [BOL-14](https://linear.app/shodh-memory/issue/BOL-14) - Async borrow checking vision
-- [BOL-44](https://linear.app/shodh-memory/issue/BOL-44) - Self-hosting milestone
+Issues and PRs welcome. The codebase is intentionally kept simple and readable.
 
 ## License
 

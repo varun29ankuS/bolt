@@ -79,6 +79,7 @@ fn lit() -> impl Parser<TokenKind, Lit, Error = ParseError> + Clone {
         TokenKind::Int(n) => Lit::Int(n, None),
         TokenKind::Float(n) => Lit::Float(n, None),
         TokenKind::Str(s) => Lit::Str(s),
+        TokenKind::RawStr(s) => Lit::Str(s),  // Raw strings are just strings
         TokenKind::Char(c) => Lit::Char(c),
         TokenKind::Byte(b) => Lit::Byte(b),
         TokenKind::ByteStr(b) => Lit::ByteStr(b),
@@ -103,16 +104,27 @@ fn lifetime() -> impl Parser<TokenKind, Ident, Error = ParseError> + Clone {
 fn type_parser() -> impl Parser<TokenKind, Type, Error = ParseError> + Clone {
     recursive(|ty| {
         // Path type with generics - uses the recursive ty handle for generic args
-        let generic_args = ty.clone()
+        // Supports types, lifetimes, and associated type bindings (Ident = Type)
+        let binding = ident()
+            .then_ignore(just(TokenKind::Eq))
+            .then(ty.clone())
+            .map(|(name, ty)| GenericArg::Binding(name, ty));
+        let generic_arg = choice((
+            lifetime().map(GenericArg::Lifetime),
+            binding,  // Try binding before type (both start with ident)
+            ty.clone().map(GenericArg::Type),
+        ));
+        let generic_args = generic_arg
             .separated_by(just(TokenKind::Comma))
             .allow_trailing()
             .delimited_by(just(TokenKind::Lt), just(TokenKind::Gt))
-            .map(|args| GenericArgs {
-                args: args.into_iter().map(GenericArg::Type).collect(),
-            });
+            .map(|args| GenericArgs { args });
 
-        // Type segment can be an identifier or Self keyword
+        // Type segment can be an identifier or path keyword (crate, self, super, Self)
         let type_ident = choice((
+            keyword(Keyword::Crate).map_with_span(|_, span| Ident::new("crate".to_string(), span_from_range(span))),
+            keyword(Keyword::SelfLower).map_with_span(|_, span| Ident::new("self".to_string(), span_from_range(span))),
+            keyword(Keyword::Super).map_with_span(|_, span| Ident::new("super".to_string(), span_from_range(span))),
             keyword(Keyword::SelfType).map_with_span(|_, span| Ident::new("Self".to_string(), span_from_range(span))),
             ident(),
         ));
@@ -225,14 +237,21 @@ fn type_bounds() -> impl Parser<TokenKind, Vec<TypeBound>, Error = ParseError> +
 fn type_bounds_with(
     ty: impl Parser<TokenKind, Type, Error = ParseError> + Clone,
 ) -> impl Parser<TokenKind, Vec<TypeBound>, Error = ParseError> + Clone {
-    // Generic args parser
-    let generic_args = ty
+    // Generic args parser with support for associated type bindings (Error = T)
+    let binding = ident()
+        .then_ignore(just(TokenKind::Eq))
+        .then(ty.clone())
+        .map(|(name, t)| GenericArg::Binding(name, t));
+    let generic_arg = choice((
+        lifetime().map(GenericArg::Lifetime),
+        binding,  // Try binding before type (both start with ident)
+        ty.clone().map(GenericArg::Type),
+    ));
+    let generic_args = generic_arg
         .separated_by(just(TokenKind::Comma))
         .allow_trailing()
         .delimited_by(just(TokenKind::Lt), just(TokenKind::Gt))
-        .map(|args| GenericArgs {
-            args: args.into_iter().map(GenericArg::Type).collect(),
-        });
+        .map(|args| GenericArgs { args });
 
     // Path segment with optional generic args
     let type_ident = choice((
@@ -266,27 +285,121 @@ fn type_bounds_with(
 // ============================================================================
 
 fn path_parser() -> impl Parser<TokenKind, Path, Error = ParseError> + Clone {
-    // Simple path parser for expressions - no generic args to avoid mutual recursion
-    // Turbofish syntax (e.g., Vec::<i32>::new()) can be handled separately if needed
+    // Path parser with turbofish support (e.g., Vec::<i32>::new(), syn::parse2::<Expr>())
+    // Uses simple_type_parser for generic args to avoid deep recursion
 
-    // Path segment can be an identifier or a keyword like crate/self/super/Self
-    let path_segment = choice((
-        // Keywords that can appear in paths
+    // Path segment identifier (keyword or regular ident)
+    let segment_ident = choice((
         keyword(Keyword::Crate).map_with_span(|_, span| Ident::new("crate".to_string(), span_from_range(span))),
         keyword(Keyword::SelfLower).map_with_span(|_, span| Ident::new("self".to_string(), span_from_range(span))),
         keyword(Keyword::Super).map_with_span(|_, span| Ident::new("super".to_string(), span_from_range(span))),
         keyword(Keyword::SelfType).map_with_span(|_, span| Ident::new("Self".to_string(), span_from_range(span))),
-        // Regular identifier
         ident(),
-    )).map(|ident| PathSegment { ident, args: None });
+    ));
 
-    path_segment
+    // Turbofish generic args: ::<T, U> (the :: is parsed before we get here)
+    let turbofish_args = just(TokenKind::Lt)
+        .ignore_then(
+            simple_type_parser()
+                .separated_by(just(TokenKind::Comma))
+                .allow_trailing()
+        )
+        .then_ignore(just(TokenKind::Gt))
+        .map(|args| GenericArgs {
+            args: args.into_iter().map(GenericArg::Type).collect(),
+        });
+
+    // First segment: ident optionally followed by turbofish (no leading ::)
+    let first_segment = segment_ident.clone()
+        .then(
+            just(TokenKind::PathSep)
+                .ignore_then(turbofish_args.clone())
+                .or_not()
+        )
+        .map(|(ident, args)| PathSegment { ident, args });
+
+    // Subsequent segments: :: ident optionally followed by turbofish
+    let rest_segment = just(TokenKind::PathSep)
+        .ignore_then(segment_ident.clone())
+        .then(
+            just(TokenKind::PathSep)
+                .ignore_then(turbofish_args)
+                .or_not()
+        )
+        .map(|(ident, args)| PathSegment { ident, args });
+
+    first_segment
+        .then(rest_segment.repeated())
+        .map_with_span(|(first, rest), span| {
+            let mut segments = vec![first];
+            segments.extend(rest);
+            Path {
+                segments,
+                span: span_from_range(span),
+            }
+        })
+}
+
+/// Simple type parser for turbofish - handles basic types without deep recursion
+fn simple_type_parser() -> impl Parser<TokenKind, Type, Error = ParseError> + Clone {
+    // Infer type: _
+    let infer_type = just(TokenKind::Underscore)
+        .map_with_span(|_, span| Type { kind: TypeKind::Infer, span: span_from_range(span) });
+
+    // Unit type: ()
+    let unit_type = just(TokenKind::LParen)
+        .then(just(TokenKind::RParen))
+        .map_with_span(|_, span| Type { kind: TypeKind::Tuple(vec![]), span: span_from_range(span) });
+
+    // Simple path-based type (Foo, std::io::Result, crate::hir::Crate, etc.)
+    let segment = choice((
+        keyword(Keyword::Crate).map_with_span(|_, span| Ident::new("crate".to_string(), span_from_range(span))),
+        keyword(Keyword::SelfLower).map_with_span(|_, span| Ident::new("self".to_string(), span_from_range(span))),
+        keyword(Keyword::Super).map_with_span(|_, span| Ident::new("super".to_string(), span_from_range(span))),
+        keyword(Keyword::SelfType).map_with_span(|_, span| Ident::new("Self".to_string(), span_from_range(span))),
+        ident(),
+    )).then(
+        // Optional generic args for the type itself
+        ident()
+            .separated_by(just(TokenKind::Comma))
+            .allow_trailing()
+            .delimited_by(just(TokenKind::Lt), just(TokenKind::Gt))
+            .map(|idents| GenericArgs {
+                args: idents.into_iter().map(|i| GenericArg::Type(Type {
+                    kind: TypeKind::Path(Path {
+                        segments: vec![PathSegment { ident: i, args: None }],
+                        span: Span::dummy(),
+                    }),
+                    span: Span::dummy(),
+                })).collect(),
+            })
+            .or_not()
+    ).map(|(ident, args)| PathSegment { ident, args });
+
+    let path = segment
         .separated_by(just(TokenKind::PathSep))
         .at_least(1)
         .map_with_span(|segments, span| Path {
             segments,
             span: span_from_range(span),
-        })
+        });
+
+    // Reference types: &T, &mut T
+    let ref_type = just(TokenKind::And)
+        .ignore_then(keyword(Keyword::Mut).or_not().map(|m| m.is_some()))
+        .then(path.clone())
+        .map(|(mutable, p)| TypeKind::Ref {
+            lifetime: None,
+            mutable,
+            inner: Box::new(Type { kind: TypeKind::Path(p), span: Span::dummy() }),
+        });
+
+    choice((
+        infer_type,
+        unit_type,
+        ref_type.map_with_span(|kind, span| Type { kind, span: span_from_range(span) }),
+        path.map(TypeKind::Path).map_with_span(|kind, span| Type { kind, span: span_from_range(span) }),
+    ))
 }
 
 // ============================================================================
@@ -837,7 +950,7 @@ fn expr_parser_with(
                 kind: ExprKind::Binary { op, left: Box::new(a), right: Box::new(b) },
             });
 
-        let cond_expr = cond_logical_and.clone()
+        let cond_logical_or = cond_logical_and.clone()
             .then(
                 just(TokenKind::OrOr).to(BinOp::Or)
                     .then(cond_logical_and.clone())
@@ -848,22 +961,53 @@ fn expr_parser_with(
                 kind: ExprKind::Binary { op, left: Box::new(a), right: Box::new(b) },
             });
 
+        // Range expressions for conditions (needed for for-loop iterators)
+        let cond_logical_or_boxed = cond_logical_or.clone().boxed();
+        let cond_expr = cond_logical_or_boxed.clone()
+            .then(
+                choice((
+                    just(TokenKind::DotDotEq)
+                        .ignore_then(cond_logical_or_boxed.clone())
+                        .map(|end| (true, Some(end))),
+                    just(TokenKind::DotDot)
+                        .ignore_then(cond_logical_or_boxed.clone().or_not())
+                        .map(|end| (false, end)),
+                ))
+                .or_not()
+            )
+            .map_with_span(|(start, range_end), span| {
+                match range_end {
+                    Some((inclusive, end)) => Expr {
+                        kind: ExprKind::Range {
+                            start: Some(Box::new(start)),
+                            end: end.map(Box::new),
+                            inclusive,
+                        },
+                        span: span_from_range(span),
+                    },
+                    None => start,
+                }
+            });
+
         // ========================================================================
         // End of condition expression parser
         // ========================================================================
 
         // Let condition for if let / while let: let Pattern = expr
+        // Use cond_expr to avoid struct literal ambiguity (e.g., if let x = foo { y } else {})
         let let_cond = keyword(Keyword::Let)
             .ignore_then(pat.clone())
             .then_ignore(just(TokenKind::Eq))
-            .then(expr.clone())
+            .then(cond_expr.clone())
             .map_with_span(|(pat, e), span| Expr {
                 kind: ExprKind::Let { pat, expr: Box::new(e) },
                 span: span_from_range(span),
             });
 
+        // Box the condition to fix parser interaction issue with block
+        let if_cond = let_cond.clone().or(cond_expr.clone()).boxed();
         let if_expr = keyword(Keyword::If)
-            .ignore_then(let_cond.clone().or(cond_expr.clone()))
+            .ignore_then(if_cond)
             .then(block.clone())
             .then(keyword(Keyword::Else).ignore_then(
                 block.clone().map(|b| Expr { kind: ExprKind::Block(b), span: Span::dummy() })
@@ -875,10 +1019,20 @@ fn expr_parser_with(
                 else_branch: else_branch.map(Box::new),
             });
 
+        // Match arm body: block bodies don't need postfix parsing (avoids (pat) ambiguity)
+        // If body is a block, parse just the block without postfix operators
+        // This prevents { foo() }(bar) from being parsed as a call on the block
+        let match_arm_body = choice((
+            // Block body - standalone, no postfix (fixes ambiguity with tuple patterns)
+            block.clone().map(|b| Expr { kind: ExprKind::Block(b), span: Span::dummy() }),
+            // Non-block expression (includes blocks with postfix if explicitly written)
+            expr.clone(),
+        ));
+
         let match_arm = pat.clone()
             .then(just(TokenKind::Keyword(Keyword::If)).ignore_then(cond_expr.clone()).or_not())
             .then_ignore(just(TokenKind::FatArrow))
-            .then(expr.clone())
+            .then(match_arm_body)
             .map_with_span(|((pattern, guard), body), span| MatchArm {
                 pattern,
                 guard: guard.map(Box::new),
@@ -904,8 +1058,10 @@ fn expr_parser_with(
             .ignore_then(block.clone())
             .map(|body| ExprKind::Loop { label: None, body });
 
+        // Use boxed condition to fix parser interaction issue
+        let while_cond = let_cond.clone().or(cond_expr.clone()).boxed();
         let while_expr = keyword(Keyword::While)
-            .ignore_then(let_cond.clone().or(cond_expr.clone()))
+            .ignore_then(while_cond)
             .then(block.clone())
             .map(|(cond, body)| ExprKind::While {
                 label: None,
@@ -913,10 +1069,12 @@ fn expr_parser_with(
                 body,
             });
 
+        // Box the iterator expr to fix parser interaction issue with block
+        let for_iter = cond_expr.clone().boxed();
         let for_expr = keyword(Keyword::For)
             .ignore_then(pat.clone())
             .then_ignore(keyword(Keyword::In))
-            .then(cond_expr.clone())
+            .then(for_iter)
             .then(block.clone())
             .map(|((pat, iter), body)| ExprKind::For {
                 label: None,
@@ -1448,6 +1606,88 @@ fn stmt_parser(
             span: span_from_range(span),
         }));
 
+    // Inner field: name: Type  (for inner structs)
+    let inner_field = ident()
+        .then_ignore(just(TokenKind::Colon))
+        .then(ty.clone())
+        .map_with_span(|(name, field_ty), span| Field {
+            name,
+            ty: field_ty,
+            is_pub: false,
+            span: span_from_range(span),
+        });
+
+    // Inner variant: Name or Name(Types) or Name { fields }
+    let inner_variant = ident()
+        .then(
+            // Tuple variant: Name(Type1, Type2)
+            ty.clone()
+                .separated_by(just(TokenKind::Comma))
+                .allow_trailing()
+                .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
+                .map(StructFields::Tuple)
+            // Named variant: Name { x: Type }
+            .or(
+                inner_field.clone()
+                    .separated_by(just(TokenKind::Comma))
+                    .allow_trailing()
+                    .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
+                    .map(StructFields::Named)
+            )
+            // Unit variant: Name
+            .or_not()
+            .map(|f| f.unwrap_or(StructFields::Unit))
+        )
+        .map_with_span(|(name, fields), span| Variant {
+            name,
+            fields,
+            discriminant: None,
+            span: span_from_range(span),
+        });
+
+    // Inner struct: #[derive(...)] struct Name { ... } or struct Name { ... }
+    let inner_struct = skip_attributes()
+        .ignore_then(keyword(Keyword::Struct))
+        .ignore_then(ident())
+        .then(
+            // Named struct: { field: Type, ... }
+            inner_field.clone()
+                .separated_by(just(TokenKind::Comma))
+                .allow_trailing()
+                .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
+                .map(StructFields::Named)
+            // Tuple struct: (Type, Type, ...);
+            .or(
+                ty.clone()
+                    .separated_by(just(TokenKind::Comma))
+                    .allow_trailing()
+                    .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
+                    .then_ignore(just(TokenKind::Semi))
+                    .map(StructFields::Tuple)
+            )
+            // Unit struct: ;
+            .or(just(TokenKind::Semi).map(|_| StructFields::Unit))
+        )
+        .map_with_span(|(name, fields), span| StmtKind::Item(Item {
+            kind: ItemKind::Struct(Struct { name, generics: Generics::default(), fields, is_pub: false }),
+            span: span_from_range(span),
+        }));
+
+    // Inner enum: #[derive(...)] enum Name { ... }
+    let inner_enum = skip_attributes()
+        .ignore_then(keyword(Keyword::Enum))
+        .ignore_then(ident())
+        .then(
+            inner_variant
+                .separated_by(just(TokenKind::Comma))
+                .allow_trailing()
+                .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
+        )
+        .map_with_span(|(name, variants), span| StmtKind::Item(Item {
+            kind: ItemKind::Enum(Enum { name, generics: Generics::default(), variants, is_pub: false }),
+            span: span_from_range(span),
+        }));
+
     let expr_stmt = expr.clone()
         .then(just(TokenKind::Semi).or_not())
         .map(|(e, semi)| {
@@ -1465,6 +1705,8 @@ fn stmt_parser(
         let_stmt,
         use_stmt,
         const_stmt,
+        inner_struct,
+        inner_enum,
         empty_stmt,
         expr_stmt,
     ))
@@ -1917,12 +2159,15 @@ fn variant_parser() -> impl Parser<TokenKind, Variant, Error = ParseError> + Clo
 }
 
 fn generics_parser() -> impl Parser<TokenKind, Generics, Error = ParseError> + Clone {
+    // Type parameter with optional bounds and optional default
+    // e.g., T, T: Clone, T = i32, T: Clone = i32
     let type_param = ident()
         .then(just(TokenKind::Colon).ignore_then(type_bounds()).or_not())
-        .map(|(name, bounds)| GenericParam::Type {
+        .then(just(TokenKind::Eq).ignore_then(simple_type_parser()).or_not())
+        .map(|((name, bounds), default)| GenericParam::Type {
             name,
             bounds: bounds.unwrap_or_default(),
-            default: None,
+            default,
         });
 
     let lifetime_param = lifetime()

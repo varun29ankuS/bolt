@@ -242,6 +242,8 @@ pub enum GenericArg {
     Type(Type),
     Lifetime(String),
     Const(Expr),
+    /// Associated type binding: `Error = MyError` in `Trait<Error = MyError>`
+    Binding(String, Type),
 }
 
 #[derive(Debug)]
@@ -733,6 +735,10 @@ fn hash_generic_arg<H: Hasher>(arg: &GenericArg, hasher: &mut H) {
         GenericArg::Type(ty) => hash_type(&ty.kind, hasher),
         GenericArg::Lifetime(lt) => lt.hash(hasher),
         GenericArg::Const(e) => hash_expr_kind(&e.kind, hasher),
+        GenericArg::Binding(name, ty) => {
+            name.hash(hasher);
+            hash_type(&ty.kind, hasher);
+        }
     }
 }
 

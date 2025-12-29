@@ -193,6 +193,7 @@ fn emit_error_and_exit(
     };
 
     emit_diagnostics(format, vec![diag]);
+    print_rustc_fallback(format, file);
     std::process::exit(1);
 }
 
@@ -255,6 +256,34 @@ fn emit_diagnostics(format: OutputFormat, diagnostics: Vec<JsonDiagnostic>) {
             println!("{}", report.to_json_pretty());
         }
     }
+}
+
+/// Print rustc fallback suggestion
+fn print_rustc_fallback(format: OutputFormat, file: Option<&PathBuf>) {
+    if matches!(format, OutputFormat::Human) {
+        eprintln!();
+        if let Some(path) = file {
+            eprintln!(
+                "  {} Bolt couldn't handle this. Try: {} {}",
+                "💡".yellow(),
+                "rustc --edition 2021".cyan(),
+                path.display()
+            );
+        } else {
+            eprintln!(
+                "  {} Bolt couldn't handle this. Try: {}",
+                "💡".yellow(),
+                "cargo check".cyan()
+            );
+        }
+    }
+}
+
+/// Emit diagnostics with rustc fallback suggestion, then exit
+fn emit_diagnostics_and_exit(format: OutputFormat, diagnostics: Vec<JsonDiagnostic>, file: Option<&PathBuf>) -> ! {
+    emit_diagnostics(format, diagnostics);
+    print_rustc_fallback(format, file);
+    std::process::exit(1);
 }
 
 /// Parse source code using the selected backend
@@ -330,8 +359,7 @@ fn run_file(path: &PathBuf, _args: &[String], format: OutputFormat, async_mode: 
                         .with_notes_from_vec(d.notes)
                 })
                 .collect();
-            emit_diagnostics(format, json_diags);
-            std::process::exit(1);
+            emit_diagnostics_and_exit(format, json_diags, Some(path));
         }
     }
 
@@ -400,8 +428,7 @@ fn run_file(path: &PathBuf, _args: &[String], format: OutputFormat, async_mode: 
                         .with_notes_from_vec(d.notes)
                 })
                 .collect();
-            emit_diagnostics(format, diagnostics);
-            std::process::exit(1);
+            emit_diagnostics_and_exit(format, diagnostics, Some(path));
         }
     }
 
@@ -532,14 +559,13 @@ fn build_file(path: &PathBuf, _output: Option<&std::path::Path>, release: bool, 
                     .with_notes_from_vec(d.notes)
             })
             .collect();
-        emit_diagnostics(format, diagnostics);
-        std::process::exit(1);
+        emit_diagnostics_and_exit(format, diagnostics, Some(path));
     }
 
     let mut codegen = match crate::codegen::CodeGenerator::new(Arc::clone(&registry)) {
         Ok(c) => c,
         Err(e) => {
-            emit_error_and_exit(format, ErrorCode::InternalError, &e.to_string(), None, None, None);
+            emit_error_and_exit(format, ErrorCode::InternalError, &e.to_string(), Some(path), None, None);
         }
     };
 
@@ -610,8 +636,7 @@ fn check_file(path: &PathBuf, format: OutputFormat, parser_backend: ParserBacken
                     .with_notes_from_vec(d.notes)
             })
             .collect();
-        emit_diagnostics(format, diagnostics);
-        std::process::exit(1);
+        emit_diagnostics_and_exit(format, diagnostics, Some(path));
     }
 
     let total_time = start.elapsed();

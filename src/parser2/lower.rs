@@ -76,6 +76,7 @@ impl LowerContext {
                 None
             }
             ast::ItemKind::MacroRules(m) => Some(self.lower_macro_rules(m, item.span)),
+            ast::ItemKind::ExternBlock(_) => None, // FFI not yet supported
         }
     }
 
@@ -768,6 +769,7 @@ impl LowerContext {
                     ast::GenericArg::Type(ty) => GenericArg::Type(self.lower_type(ty)),
                     ast::GenericArg::Lifetime(lt) => GenericArg::Lifetime(lt.name.clone()),
                     ast::GenericArg::Const(expr) => GenericArg::Const(self.lower_expr(expr)),
+                    ast::GenericArg::Binding(name, ty) => GenericArg::Binding(name.name.clone(), self.lower_type(ty)),
                 }
             }).collect(),
         }
