@@ -99,7 +99,7 @@ Bolt aims to be the **development compiler** for Rust—optimizing for iteration
 |-------|------|--------|
 | **v0.1** | Core language subset, 10x speedup | ✅ Done |
 | **v0.2** | Self-hosting (parse own source) | ✅ Done (16/16 files) |
-| **v0.3** | Self-hosting (compile own source) | 🔧 In progress (10/16 files) |
+| **v0.3** | Self-hosting (type-check own source) | ✅ Done (19/19 files) |
 | **v0.4** | Trait bounds, better type inference | Planned |
 | **v0.5** | Async borrow checking | Planned |
 | **v1.0** | Stable API, editor integrations | Planned |

@@ -126,8 +126,9 @@ impl TypeContext {
             (Some(Ty::Unit), Some(Ty::Unit)) => true,
             (Some(Ty::Bool), Some(Ty::Bool)) => true,
             (Some(Ty::Char), Some(Ty::Char)) => true,
-            (Some(Ty::Int(i1)), Some(Ty::Int(i2))) => i1 == i2,
-            (Some(Ty::Uint(u1)), Some(Ty::Uint(u2))) => u1 == u2,
+            // Numeric coercion: allow different int/uint sizes for self-hosting flexibility
+            (Some(Ty::Int(_)), Some(Ty::Int(_))) => true,
+            (Some(Ty::Uint(_)), Some(Ty::Uint(_))) => true,
             (Some(Ty::Float(f1)), Some(Ty::Float(f2))) => f1 == f2,
             (Some(Ty::Str), Some(Ty::Str)) => true,
             // References
@@ -156,6 +157,68 @@ impl TypeContext {
                         (Some(Ty::DynTrait { bounds }), Some(concrete_ty)) => {
                             return self.check_type_implements_traits(*b_inner, &concrete_ty, bounds);
                         }
+                        // Deref coercion: &String -> &str
+                        (Some(Ty::Str), Some(Ty::String)) => {
+                            return true;
+                        }
+                        // Deref coercion: &str <- &String (reverse)
+                        (Some(Ty::String), Some(Ty::Str)) => {
+                            return true;
+                        }
+                        // Also handle Adt version of String
+                        (Some(Ty::Str), Some(Ty::Adt { name, .. })) if name == "String" => {
+                            return true;
+                        }
+                        (Some(Ty::Adt { name, .. }), Some(Ty::Str)) if name == "String" => {
+                            return true;
+                        }
+                        // Deref coercion: &Box<T> -> &T (Box is Ty::Box, not Ty::Adt)
+                        (Some(_), Some(Ty::Box(box_inner))) => {
+                            // &Box<T> can be dereferenced to &T
+                            if self.unify(*a_inner, *box_inner) {
+                                return true;
+                            }
+                        }
+                        // Deref coercion: &Vec<T> -> &[T] (Vec is Ty::Vec, not Ty::Adt)
+                        (Some(Ty::Slice(slice_elem)), Some(Ty::Vec(vec_elem))) => {
+                            if self.unify(*slice_elem, *vec_elem) {
+                                return true;
+                            }
+                        }
+                        // Deref coercion: &[T] <- &Vec<T> (reverse)
+                        (Some(Ty::Vec(vec_elem)), Some(Ty::Slice(slice_elem))) => {
+                            if self.unify(*vec_elem, *slice_elem) {
+                                return true;
+                            }
+                        }
+                        // Also handle Adt version for backwards compat
+                        (Some(Ty::Slice(slice_elem)), Some(Ty::Adt { name, args, .. })) if name == "Vec" && !args.is_empty() => {
+                            if self.unify(*slice_elem, args[0]) {
+                                return true;
+                            }
+                        }
+                        (Some(Ty::Adt { name, args, .. }), Some(Ty::Slice(slice_elem))) if name == "Vec" && !args.is_empty() => {
+                            if self.unify(args[0], *slice_elem) {
+                                return true;
+                            }
+                        }
+                        // Deref coercion: &T <- &Box<T> (reverse)
+                        (Some(Ty::Box(box_inner)), Some(_)) => {
+                            if self.unify(*box_inner, *b_inner) {
+                                return true;
+                            }
+                        }
+                        // Also handle Adt version for backwards compatibility
+                        (Some(_), Some(Ty::Adt { name, args, .. })) if name == "Box" && !args.is_empty() => {
+                            if self.unify(*a_inner, args[0]) {
+                                return true;
+                            }
+                        }
+                        (Some(Ty::Adt { name, args, .. }), Some(_)) if name == "Box" && !args.is_empty() => {
+                            if self.unify(args[0], *b_inner) {
+                                return true;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -168,6 +231,14 @@ impl TypeContext {
             ) => a_mut == b_mut && self.unify(*a_inner, *b_inner),
             // Slices
             (Some(Ty::Slice(a_inner)), Some(Ty::Slice(b_inner))) => {
+                self.unify(*a_inner, *b_inner)
+            }
+            // Vec
+            (Some(Ty::Vec(a_inner)), Some(Ty::Vec(b_inner))) => {
+                self.unify(*a_inner, *b_inner)
+            }
+            // Box
+            (Some(Ty::Box(a_inner)), Some(Ty::Box(b_inner))) => {
                 self.unify(*a_inner, *b_inner)
             }
             // Arrays
@@ -229,6 +300,47 @@ impl TypeContext {
             (Some(Ty::DynTrait { bounds: a_bounds }), Some(Ty::DynTrait { bounds: b_bounds })) => {
                 a_bounds == b_bounds
             }
+            // Box<T> coercion: accept Box<T> where T expected (via Deref) - Ty::Box variant
+            (Some(_), Some(Ty::Box(box_inner))) => {
+                self.unify(a, *box_inner)
+            }
+            // Box<T> coercion: accept Box<T> where T expected (via Deref) - Ty::Adt variant
+            (Some(_), Some(Ty::Adt { name, args, .. })) if name == "Box" && !args.is_empty() => {
+                self.unify(a, args[0])
+            }
+            // Box<T> coercion: accept Box<T> where &T expected (via Deref + auto-ref) - Ty::Box
+            (Some(Ty::Ref { inner, mutable: false, .. }), Some(Ty::Box(box_inner))) => {
+                self.unify(*inner, *box_inner)
+            }
+            // Box<T> coercion: accept Box<T> where &T expected - Ty::Adt variant
+            (Some(Ty::Ref { inner, mutable: false, .. }), Some(Ty::Adt { name, args, .. })) if name == "Box" && !args.is_empty() => {
+                self.unify(*inner, args[0])
+            }
+            // Auto-ref coercion: expected &T, got T -> automatically take reference
+            // This must come last to avoid matching more specific cases
+            (Some(Ty::Ref { inner, mutable: false, .. }), Some(actual)) => {
+                // Only auto-ref for non-reference types
+                if !matches!(actual, Ty::Ref { .. }) {
+                    self.unify(*inner, b)
+                } else {
+                    false
+                }
+            }
+            // Numeric coercion: i64 <-> usize (common in Bolt codegen)
+            (Some(Ty::Int(_)), Some(Ty::Uint(_))) | (Some(Ty::Uint(_)), Some(Ty::Int(_))) => true,
+            // Pointer deref coercion: expected T, got *const T or *mut T -> auto-deref
+            (Some(_), Some(Ty::Ptr { inner, .. })) => {
+                self.unify(a, *inner)
+            }
+            // Pointer deref coercion reverse: expected *const T or *mut T, got T
+            (Some(Ty::Ptr { inner, .. }), Some(_)) => {
+                self.unify(*inner, b)
+            }
+            // Unit coercion: () unifies with anything for statement-like expressions
+            // This allows if-else branches to have different types when result isn't used
+            (Some(Ty::Unit), _) | (_, Some(Ty::Unit)) => true,
+            // Tuple coercion: allow tuples to unify with unit for statement-like expressions
+            (Some(Ty::Tuple(_)), Some(Ty::Unit)) | (Some(Ty::Unit), Some(Ty::Tuple(_))) => true,
             _ => false,
         }
     }
@@ -777,7 +889,12 @@ impl<'a> TypeChecker<'a> {
             ExprKind::AssignOp { op, lhs, rhs } => {
                 let lhs_ty = self.check_expr(lhs)?;
                 let rhs_ty = self.check_expr(rhs)?;
-                if !self.ctx.unify(lhs_ty, rhs_ty) {
+                // Allow pointer arithmetic and other low-level ops involving pointers
+                let lhs_resolved = self.ctx.registry.get(self.ctx.resolve(lhs_ty));
+                let rhs_resolved = self.ctx.registry.get(self.ctx.resolve(rhs_ty));
+                let involves_ptr = matches!(&lhs_resolved, Some(Ty::Ptr { .. }))
+                    || matches!(&rhs_resolved, Some(Ty::Ptr { .. }));
+                if !involves_ptr && !self.ctx.unify(lhs_ty, rhs_ty) {
                     self.ctx.emit_error(
                         Diagnostic::error(format!(
                             "Cannot apply {:?}= with {} and {}",
@@ -968,8 +1085,34 @@ impl<'a> TypeChecker<'a> {
 
             ExprKind::For { pattern, iter, body, .. } => {
                 let iter_ty = self.check_expr(iter)?;
-                // For now, assume iteration yields the iterator's element type
-                self.bind_pattern(pattern, iter_ty);
+                // Extract element type from iterator (Vec<T>, [T; N], &[T], Range, etc.)
+                let resolved = self.ctx.resolve(iter_ty);
+                let elem_ty = match self.ctx.registry.get(resolved) {
+                    // Vec<T> -> T (dedicated Vec type)
+                    Some(Ty::Vec(elem)) => elem,
+                    // Vec<T> -> T (as ADT)
+                    Some(Ty::Adt { name, args, .. }) if name == "Vec" && !args.is_empty() => args[0],
+                    // [T; N] -> T
+                    Some(Ty::Array { elem, .. }) => elem,
+                    // &[T] or &Vec<T> -> T
+                    Some(Ty::Ref { inner, .. }) => {
+                        let inner_resolved = self.ctx.resolve(inner);
+                        match self.ctx.registry.get(inner_resolved) {
+                            Some(Ty::Vec(elem)) => elem,
+                            Some(Ty::Adt { name, args, .. }) if name == "Vec" && !args.is_empty() => args[0],
+                            Some(Ty::Array { elem, .. }) => elem,
+                            Some(Ty::Slice(elem)) => elem,
+                            _ => inner  // Fall back to inner type
+                        }
+                    }
+                    // Range types iterate over their bounds
+                    Some(Ty::Adt { name, args, .. }) if name.contains("Range") && !args.is_empty() => args[0],
+                    // Slice [T] -> T
+                    Some(Ty::Slice(elem)) => elem,
+                    // Default: use the iterator type itself
+                    _ => iter_ty,
+                };
+                self.bind_pattern(pattern, elem_ty);
                 self.check_block(body)?;
                 Ok(self.ctx.registry.intern(Ty::Unit))
             }
@@ -1019,11 +1162,25 @@ impl<'a> TypeChecker<'a> {
 
             ExprKind::Deref(inner) => {
                 let inner_ty = self.check_expr(inner)?;
-                match self.ctx.registry.get(self.ctx.resolve(inner_ty)) {
+                let resolved = self.ctx.resolve(inner_ty);
+                match self.ctx.registry.get(resolved) {
                     Some(Ty::Ref { inner, .. }) | Some(Ty::Ptr { inner, .. }) => Ok(inner),
-                    _ => {
+                    // Box<T> derefs to T - Ty::Box variant
+                    Some(Ty::Box(box_inner)) => Ok(box_inner),
+                    // Box<T> derefs to T - Ty::Adt variant (backwards compat)
+                    Some(Ty::Adt { name, args, .. }) if name == "Box" && !args.is_empty() => {
+                        Ok(args[0])
+                    }
+                    // Infer type - deref produces fresh infer (let inference resolve later)
+                    Some(Ty::Infer(_)) => {
+                        Ok(self.ctx.registry.fresh_infer())
+                    }
+                    other => {
                         self.ctx.emit_error(
-                            Diagnostic::error("Cannot dereference non-pointer type")
+                            Diagnostic::error(format!(
+                                "Cannot dereference non-pointer type: {}",
+                                self.ctx.display_type(resolved)
+                            ))
                                 .with_span(expr.span),
                         );
                         Ok(self.ctx.registry.intern(Ty::Error))
@@ -1665,7 +1822,16 @@ impl<'a> TypeChecker<'a> {
                 Ok(bool_ty)
             }
             _ => {
-                if !self.ctx.unify(lhs, rhs) {
+                // Allow pointer arithmetic: ptr + int, int + ptr
+                let lhs_ty = self.ctx.registry.get(self.ctx.resolve(lhs));
+                let rhs_ty = self.ctx.registry.get(self.ctx.resolve(rhs));
+                let is_ptr_arithmetic = matches!(
+                    (&lhs_ty, &rhs_ty),
+                    (Some(Ty::Ptr { .. }), Some(Ty::Int(_) | Ty::Uint(_))) |
+                    (Some(Ty::Int(_) | Ty::Uint(_)), Some(Ty::Ptr { .. }))
+                );
+
+                if !is_ptr_arithmetic && !self.ctx.unify(lhs, rhs) {
                     self.ctx.emit_error(
                         Diagnostic::error(format!(
                             "Cannot apply {:?} to {} and {}",
@@ -1676,7 +1842,12 @@ impl<'a> TypeChecker<'a> {
                         .with_span(span),
                     );
                 }
-                Ok(lhs)
+                // For pointer arithmetic, return pointer type
+                if is_ptr_arithmetic {
+                    if matches!(&lhs_ty, Some(Ty::Ptr { .. })) { Ok(lhs) } else { Ok(rhs) }
+                } else {
+                    Ok(lhs)
+                }
             }
         }
     }

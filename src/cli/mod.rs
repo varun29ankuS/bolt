@@ -628,14 +628,23 @@ fn check_file(path: &PathBuf, format: OutputFormat, parser_backend: ParserBacken
     let has_errors = type_ctx.has_errors() || borrow_checker.has_errors();
 
     if has_errors {
-        let diagnostics: Vec<JsonDiagnostic> = borrow_checker
+        // Collect type checker diagnostics
+        let mut diagnostics: Vec<JsonDiagnostic> = type_ctx
+            .take_diagnostics()
+            .into_iter()
+            .map(|d| {
+                JsonDiagnostic::error(ErrorCode::TypeMismatch, &d.message)
+                    .with_notes_from_vec(d.notes)
+            })
+            .collect();
+        // Collect borrow checker diagnostics
+        diagnostics.extend(borrow_checker
             .take_diagnostics()
             .into_iter()
             .map(|d| {
                 JsonDiagnostic::error(ErrorCode::BorrowOfMovedValue, &d.message)
                     .with_notes_from_vec(d.notes)
-            })
-            .collect();
+            }));
         emit_diagnostics_and_exit(format, diagnostics, Some(path));
     }
 

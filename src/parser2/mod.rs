@@ -614,6 +614,12 @@ fn expr_parser_with(
     simple_pat: impl Parser<TokenKind, Pattern, Error = ParseError> + Clone + 'static,
     balanced_tokens: impl Parser<TokenKind, (), Error = ParseError> + Clone + 'static,
 ) -> impl Parser<TokenKind, Expr, Error = ParseError> + Clone {
+    // Box the input parsers ONCE to make cloning cheap (pointer copy vs tree copy)
+    let ty = ty.boxed();
+    let pat = pat.boxed();
+    let simple_pat = simple_pat.boxed();
+    let balanced_tokens = balanced_tokens.boxed();
+
     recursive(move |expr| {
         let balanced_tokens = balanced_tokens.clone();
         let ty = ty.clone();
@@ -820,20 +826,22 @@ fn expr_parser_with(
         let cond_ref_op = just(TokenKind::And)
             .ignore_then(keyword(Keyword::Mut).or_not().map(|m| m.is_some()));
 
-        // Build unary with foldr for right-associativity
+        // Build unary with manual fold (faster than foldr)
         let cond_unary = cond_prefix_op.clone()
             .map(|op| (op, false))
             .or(cond_ref_op.map(|mutable| (if mutable { UnaryOp::RefMut } else { UnaryOp::Ref }, true)))
             .repeated()
             .then(cond_postfix.clone())
-            .foldr(|(op, is_ref), expr: Expr| {
-                let span = expr.span;
-                let kind = if is_ref {
-                    ExprKind::Ref { mutable: op == UnaryOp::RefMut, expr: Box::new(expr) }
-                } else {
-                    ExprKind::Unary { op, expr: Box::new(expr) }
-                };
-                Expr { span, kind }
+            .map(|(ops, base): (Vec<_>, Expr)| {
+                ops.into_iter().rev().fold(base, |expr, (op, is_ref)| {
+                    let span = expr.span;
+                    let kind = if is_ref {
+                        ExprKind::Ref { mutable: op == UnaryOp::RefMut, expr: Box::new(expr) }
+                    } else {
+                        ExprKind::Unary { op, expr: Box::new(expr) }
+                    };
+                    Expr { span, kind }
+                })
             });
 
         // Type cast for conditions
@@ -1140,27 +1148,82 @@ fn expr_parser_with(
                 }),
         ));
 
-        // Primary expression
+        // Primary expression - OPTIMIZED with token-based dispatch
+        // Instead of trying 18 alternatives with backtracking, dispatch based on first token
+
+        // Group 1: Keyword-dispatched expressions (O(1) lookup instead of O(n) backtracking)
+        let keyword_atom = select! {
+            TokenKind::Keyword(Keyword::If) => 0,
+            TokenKind::Keyword(Keyword::Match) => 1,
+            TokenKind::Keyword(Keyword::Loop) => 2,
+            TokenKind::Keyword(Keyword::While) => 3,
+            TokenKind::Keyword(Keyword::For) => 4,
+            TokenKind::Keyword(Keyword::Return) => 5,
+            TokenKind::Keyword(Keyword::Break) => 6,
+            TokenKind::Keyword(Keyword::Continue) => 7,
+            TokenKind::Keyword(Keyword::Unsafe) => 8,
+            TokenKind::Keyword(Keyword::SelfLower) => 9,
+            TokenKind::Keyword(Keyword::Move) => 10,
+        }.try_map(move |tag, span| {
+            // Return the tag to signal which parser to use
+            // The actual parsing happens in rewind + then
+            Ok::<_, Simple<TokenKind>>(tag)
+        }).rewind()  // Put the token back for the actual parser
+        .ignore_then(choice((
+            if_expr.clone(),
+            match_expr.clone(),
+            loop_expr.clone(),
+            while_expr.clone(),
+            for_expr.clone(),
+            return_expr.clone(),
+            break_expr.clone(),
+            continue_expr.clone(),
+            unsafe_expr.clone(),
+            self_expr.clone(),
+            closure.clone(),
+        )));
+
+        // Group 2: Delimiter-dispatched expressions (brackets, parens, braces)
+        let delim_atom = select! {
+            TokenKind::LParen => 0,
+            TokenKind::LBracket => 1,
+            TokenKind::LBrace => 2,
+            TokenKind::Or => 3,
+            TokenKind::OrOr => 4,
+        }.rewind()
+        .ignore_then(choice((
+            tuple_expr.clone(),
+            array_expr.clone(),
+            block_expr.clone(),
+            closure.clone(),
+            closure.clone(),
+        )));
+
+        // Group 3: Range expressions (start with ..)
+        let range_atom = select! {
+            TokenKind::DotDot => 0,
+            TokenKind::DotDotEq => 1,
+        }.rewind()
+        .ignore_then(prefix_range.clone());
+
+        // Group 4: Literals (direct token match, no backtracking)
+        let literal_atom = lit_expr.clone();
+
+        // Group 5: Path-based expressions (ident, ::, macro_rules!, macro!)
+        // This is the fallback for identifiers and paths
+        let path_atom = choice((
+            macro_rules_expr.clone(),
+            macro_call.clone(),
+            path_expr.clone(),
+        ));
+
+        // Combine groups - now only 5 top-level alternatives instead of 18
         let atom = choice((
-            prefix_range,  // must come before other atoms
-            lit_expr,
-            if_expr,
-            match_expr,
-            loop_expr,
-            while_expr,
-            for_expr,
-            return_expr,
-            break_expr,
-            continue_expr,
-            closure,
-            unsafe_expr,  // must come before block_expr
-            block_expr,
-            tuple_expr,
-            array_expr,
-            self_expr,  // must come before path_expr
-            macro_rules_expr, // macro_rules! definitions (before macro_call)
-            macro_call, // must come before path_expr
-            path_expr,
+            keyword_atom,
+            delim_atom,
+            range_atom,
+            literal_atom,
+            path_atom,
         ))
         .map_with_span(|kind, span| Expr { kind, span: span_from_range(span) })
         .boxed();
@@ -1324,10 +1387,22 @@ fn expr_parser_with(
             Expr { span, kind }
         };
 
+        // Manual fold is faster than foldr (avoids state cloning overhead)
         let unary = prefix_op.clone()
             .repeated()
             .then(postfix.clone())
-            .foldr(fold_unary);
+            .map(move |(ops, base): (Vec<_>, Expr)| {
+                ops.into_iter().rev().fold(base, |expr, op| {
+                    let span = expr.span;
+                    let kind = match op {
+                        PrefixOp::Neg => ExprKind::Unary { op: UnaryOp::Neg, expr: Box::new(expr) },
+                        PrefixOp::Not => ExprKind::Unary { op: UnaryOp::Not, expr: Box::new(expr) },
+                        PrefixOp::Deref => ExprKind::Unary { op: UnaryOp::Deref, expr: Box::new(expr) },
+                        PrefixOp::Ref(mutable) => ExprKind::Ref { mutable, expr: Box::new(expr) },
+                    };
+                    Expr { span, kind }
+                })
+            });
 
         // Type cast: expr as Type
         let cast = unary.clone()
