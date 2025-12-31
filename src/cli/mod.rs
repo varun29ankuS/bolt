@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::error::{
-    DiagnosticLevel, DiagnosticReport, ErrorCode, JsonDiagnostic, SourceLocation,
+    DiagnosticLevel, DiagnosticReport, ErrorCode, JsonDiagnostic, SourceLocation, source_map,
 };
 use crate::ty::TypeRegistry;
 use std::sync::Arc;
@@ -299,20 +299,28 @@ fn emit_diagnostics_and_exit(format: OutputFormat, diagnostics: Vec<JsonDiagnost
 }
 
 /// Parse source code using the selected backend
+/// Also loads the source file into the global SourceMap for rich error reporting
 fn parse_with_backend(
     path: &PathBuf,
     parser: ParserBackend,
     format: OutputFormat,
-) -> Result<crate::hir::Crate, String> {
+) -> Result<(crate::hir::Crate, u32), String> {
+    // Load source file into SourceMap for rich error reporting
+    let file_id = source_map()
+        .load_file(path)
+        .map_err(|e| format!("Failed to read file: {}", e))?;
+
     match parser {
         ParserBackend::Syn => {
             let syn_parser = crate::parser::Parser::new();
-            syn_parser.parse_crate(path).map_err(|e| e.to_string())
+            syn_parser.parse_crate(path)
+                .map(|krate| (krate, file_id))
+                .map_err(|e| e.to_string())
         }
         ParserBackend::Chumsky => {
-            // Read source file
-            let source = std::fs::read_to_string(path)
-                .map_err(|e| format!("Failed to read file: {}", e))?;
+            // Get source from SourceMap (already loaded)
+            let source_file = source_map().get_file(file_id)
+                .ok_or_else(|| "Failed to get source file from map".to_string())?;
 
             // Get crate name from file stem
             let crate_name = path
@@ -324,7 +332,8 @@ fn parse_with_backend(
                 eprintln!("  {} Using Chumsky parser (experimental)", "⚡".yellow());
             }
 
-            crate::parser2::lower::parse_and_lower(&source, crate_name)
+            crate::parser2::lower::parse_and_lower_with_file_id(&source_file.content, crate_name, file_id)
+                .map(|krate| (krate, file_id))
                 .map_err(|errors| errors.join("\n"))
         }
     }
@@ -379,7 +388,7 @@ fn run_file(path: &PathBuf, _args: &[String], format: OutputFormat, async_mode: 
         println!("{} {} {}", "⚡".yellow(), "Compiling".green().bold(), path.display());
     }
 
-    let krate = match parse_with_backend(path, parser_backend, format) {
+    let (krate, _file_id) = match parse_with_backend(path, parser_backend, format) {
         Ok(k) => k,
         Err(e) => {
             emit_error_and_exit(format, ErrorCode::UnexpectedToken, &e, Some(path), None, None);
@@ -400,17 +409,7 @@ fn run_file(path: &PathBuf, _args: &[String], format: OutputFormat, async_mode: 
         let diagnostics: Vec<JsonDiagnostic> = type_ctx
             .take_diagnostics()
             .into_iter()
-            .map(|d| JsonDiagnostic {
-                level: d.level,
-                code: ErrorCode::TypeMismatch,
-                message: d.message,
-                location: None,
-                source_snippet: None,
-                labels: vec![],
-                notes: d.notes,
-                suggestions: vec![],
-                help: None,
-            })
+            .map(|d| JsonDiagnostic::from_diagnostic(d, ErrorCode::TypeMismatch))
             .collect();
         emit_diagnostics(format, diagnostics);
         emit_error_and_exit(format, ErrorCode::TypeMismatch, "Type checking failed", Some(path), None, None);
@@ -541,7 +540,7 @@ fn build_file(path: &PathBuf, _output: Option<&std::path::Path>, release: bool, 
         );
     }
 
-    let krate = match parse_with_backend(path, parser_backend, format) {
+    let (krate, _file_id) = match parse_with_backend(path, parser_backend, format) {
         Ok(k) => k,
         Err(e) => {
             emit_error_and_exit(format, ErrorCode::UnexpectedToken, &e, Some(path), None, None);
@@ -583,10 +582,7 @@ fn build_file(path: &PathBuf, _output: Option<&std::path::Path>, release: bool, 
     if !all_diags.is_empty() {
         let diagnostics: Vec<JsonDiagnostic> = all_diags
             .into_iter()
-            .map(|d| {
-                JsonDiagnostic::error(ErrorCode::BorrowOfMovedValue, &d.message)
-                    .with_notes_from_vec(d.notes)
-            })
+            .map(|d| JsonDiagnostic::from_diagnostic(d, ErrorCode::BorrowOfMovedValue))
             .collect();
         emit_diagnostics_and_exit(format, diagnostics, Some(path));
     }
@@ -653,7 +649,7 @@ fn check_file(path: &PathBuf, format: OutputFormat, parser_backend: ParserBacken
         (path.clone(), path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string())
     };
 
-    let krate = match parse_with_backend(&entry_point, parser_backend, format) {
+    let (krate, _file_id) = match parse_with_backend(&entry_point, parser_backend, format) {
         Ok(k) => k,
         Err(e) => {
             emit_error_and_exit(format, ErrorCode::UnexpectedToken, &e, Some(&entry_point), None, None);
@@ -701,22 +697,16 @@ fn check_file(path: &PathBuf, format: OutputFormat, parser_backend: ParserBacken
     let has_errors = type_ctx.has_errors() || !all_borrow_diags.is_empty();
 
     if has_errors {
-        // Collect type checker diagnostics
+        // Collect type checker diagnostics with rich source info
         let mut diagnostics: Vec<JsonDiagnostic> = type_ctx
             .take_diagnostics()
             .into_iter()
-            .map(|d| {
-                JsonDiagnostic::error(ErrorCode::TypeMismatch, &d.message)
-                    .with_notes_from_vec(d.notes)
-            })
+            .map(|d| JsonDiagnostic::from_diagnostic(d, ErrorCode::TypeMismatch))
             .collect();
         // Collect borrow checker diagnostics (already merged fast + NLL)
         diagnostics.extend(all_borrow_diags
             .into_iter()
-            .map(|d| {
-                JsonDiagnostic::error(ErrorCode::BorrowOfMovedValue, &d.message)
-                    .with_notes_from_vec(d.notes)
-            }));
+            .map(|d| JsonDiagnostic::from_diagnostic(d, ErrorCode::BorrowOfMovedValue)));
         emit_diagnostics_and_exit(format, diagnostics, Some(&entry_point));
     }
 
@@ -913,7 +903,7 @@ fn spawn_compile(
             return;
         }
 
-        let krate = match parse_with_backend(&path, parser_backend, format) {
+        let (krate, _file_id) = match parse_with_backend(&path, parser_backend, format) {
             Ok(k) => k,
             Err(e) => {
                 if compile_id.load(Ordering::SeqCst) == my_id {

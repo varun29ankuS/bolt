@@ -21,7 +21,7 @@ path = "src/main.rs"
 # Parsing
 syn = { version = "2.0", features = ["full", "parsing", "printing"] }
 quote = "1.0"
-proc-macro2 = "1.0"
+proc-macro2 = { version = "1.0", features = ["span-locations"] }
 rustc_lexer = "0.1"  # Official Rust tokenizer (zero deps)
 chumsky = "0.9"      # Parser combinator with error recovery (https://github.com/zesterer/chumsky)
 ariadne = "0.4"      # Beautiful error reporting (pairs with chumsky)

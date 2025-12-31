@@ -1,7 +1,10 @@
 //! Error types for Bolt compiler
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use parking_lot::RwLock;
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, BoltError>;
@@ -69,6 +72,189 @@ impl Span {
             end: self.end.max(other.end),
         }
     }
+}
+
+// ============================================================================
+// Source Map for Line/Column Resolution
+// ============================================================================
+
+/// Stores source file contents and provides line/column lookup
+#[derive(Debug, Clone)]
+pub struct SourceFile {
+    pub path: PathBuf,
+    pub content: String,
+    /// Byte offset of each line start
+    line_starts: Vec<usize>,
+}
+
+impl SourceFile {
+    pub fn new(path: PathBuf, content: String) -> Self {
+        let mut line_starts = vec![0];
+        for (i, c) in content.char_indices() {
+            if c == '\n' {
+                line_starts.push(i + 1);
+            }
+        }
+        Self { path, content, line_starts }
+    }
+
+    /// Convert byte offset to (line, column), both 1-indexed
+    pub fn offset_to_line_col(&self, offset: u32) -> (usize, usize) {
+        let offset = offset as usize;
+        // Binary search for the line
+        let line = match self.line_starts.binary_search(&offset) {
+            Ok(line) => line,
+            Err(line) => line.saturating_sub(1),
+        };
+        let line_start = self.line_starts.get(line).copied().unwrap_or(0);
+        let col = offset.saturating_sub(line_start);
+        (line + 1, col + 1) // 1-indexed
+    }
+
+    /// Convert (line, column) to byte offset. Both are 1-indexed.
+    pub fn line_col_to_offset(&self, line: usize, col: usize) -> u32 {
+        if line == 0 {
+            return 0;
+        }
+        let line_idx = line.saturating_sub(1);
+        let line_start = self.line_starts.get(line_idx).copied().unwrap_or(0);
+        let col_offset = col.saturating_sub(1);
+        (line_start + col_offset) as u32
+    }
+
+    /// Get the source line at the given 1-indexed line number
+    pub fn get_line(&self, line: usize) -> Option<&str> {
+        if line == 0 { return None; }
+        let line_idx = line - 1;
+        let start = self.line_starts.get(line_idx).copied()?;
+        let end = self.line_starts.get(line_idx + 1)
+            .copied()
+            .unwrap_or(self.content.len());
+        // Trim trailing newline
+        let line_content = &self.content[start..end];
+        Some(line_content.trim_end_matches('\n').trim_end_matches('\r'))
+    }
+
+    /// Get a snippet of source code around a span
+    pub fn get_snippet(&self, start_offset: u32, end_offset: u32) -> String {
+        let (start_line, _) = self.offset_to_line_col(start_offset);
+        let (end_line, _) = self.offset_to_line_col(end_offset);
+
+        let mut lines = Vec::new();
+        for line_num in start_line..=end_line {
+            if let Some(line) = self.get_line(line_num) {
+                lines.push(format!("{:4} | {}", line_num, line));
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// Get source location from span
+    pub fn span_to_location(&self, span: Span) -> SourceLocation {
+        let (line, column) = self.offset_to_line_col(span.start);
+        let (end_line, end_column) = self.offset_to_line_col(span.end);
+        SourceLocation {
+            file: self.path.clone(),
+            line,
+            column,
+            end_line: if end_line != line { Some(end_line) } else { None },
+            end_column: if end_line != line || end_column != column { Some(end_column) } else { None },
+        }
+    }
+}
+
+/// Global source map that tracks all loaded files
+pub struct SourceMap {
+    files: RwLock<HashMap<u32, Arc<SourceFile>>>,
+    path_to_id: RwLock<HashMap<PathBuf, u32>>,
+    next_id: RwLock<u32>,
+}
+
+impl SourceMap {
+    pub fn new() -> Self {
+        Self {
+            files: RwLock::new(HashMap::new()),
+            path_to_id: RwLock::new(HashMap::new()),
+            next_id: RwLock::new(1),
+        }
+    }
+
+    /// Load a source file and return its file_id
+    pub fn load_file(&self, path: &PathBuf) -> std::io::Result<u32> {
+        // Check if already loaded
+        if let Some(&id) = self.path_to_id.read().get(path) {
+            return Ok(id);
+        }
+
+        let content = std::fs::read_to_string(path)?;
+        let file = Arc::new(SourceFile::new(path.clone(), content));
+
+        let mut next_id = self.next_id.write();
+        let id = *next_id;
+        *next_id += 1;
+
+        self.files.write().insert(id, file);
+        self.path_to_id.write().insert(path.clone(), id);
+
+        Ok(id)
+    }
+
+    /// Add source content directly (for testing or generated code)
+    pub fn add_source(&self, path: PathBuf, content: String) -> u32 {
+        let mut next_id = self.next_id.write();
+        let id = *next_id;
+        *next_id += 1;
+
+        let file = Arc::new(SourceFile::new(path.clone(), content));
+        self.files.write().insert(id, file);
+        self.path_to_id.write().insert(path, id);
+
+        id
+    }
+
+    /// Get source file by ID
+    pub fn get_file(&self, file_id: u32) -> Option<Arc<SourceFile>> {
+        self.files.read().get(&file_id).cloned()
+    }
+
+    /// Get file ID by path
+    pub fn get_file_id(&self, path: &PathBuf) -> Option<u32> {
+        self.path_to_id.read().get(path).copied()
+    }
+
+    /// Convert a span to a source location
+    pub fn span_to_location(&self, span: Span) -> Option<SourceLocation> {
+        let file = self.get_file(span.file_id)?;
+        Some(file.span_to_location(span))
+    }
+
+    /// Get source snippet for a span
+    pub fn get_snippet(&self, span: Span) -> Option<String> {
+        let file = self.get_file(span.file_id)?;
+        Some(file.get_snippet(span.start, span.end))
+    }
+
+    /// Get the line of source code containing the span
+    pub fn get_line_for_span(&self, span: Span) -> Option<String> {
+        let file = self.get_file(span.file_id)?;
+        let (line, _) = file.offset_to_line_col(span.start);
+        file.get_line(line).map(|s| s.to_string())
+    }
+}
+
+impl Default for SourceMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Global source map instance
+static SOURCE_MAP: once_cell::sync::Lazy<SourceMap> =
+    once_cell::sync::Lazy::new(SourceMap::new);
+
+/// Get the global source map
+pub fn source_map() -> &'static SourceMap {
+    &SOURCE_MAP
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,7 +348,7 @@ impl Default for DiagnosticEmitter {
 // ============================================================================
 
 /// Error code categories for LLM consumption
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     // Parse errors (E0001-E0099)
@@ -402,6 +588,194 @@ impl JsonDiagnostic {
     /// Serialize to pretty JSON for human debugging
     pub fn to_json_pretty(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Convert a simple Diagnostic to a rich JsonDiagnostic using the source map
+    pub fn from_diagnostic(diag: Diagnostic, code: ErrorCode) -> Self {
+        let mut json_diag = if diag.level == DiagnosticLevel::Error {
+            Self::error(code, &diag.message)
+        } else {
+            Self::warning(code, &diag.message)
+        };
+
+        // Add source location and snippet if span is available
+        if let Some(span) = diag.span {
+            if let Some(loc) = source_map().span_to_location(span) {
+                // Get the source line for snippet
+                if let Some(line_content) = source_map().get_line_for_span(span) {
+                    json_diag.source_snippet = Some(format!(
+                        "{:4} | {}\n     | {}{}",
+                        loc.line,
+                        line_content,
+                        " ".repeat(loc.column.saturating_sub(1)),
+                        "^".repeat((span.end - span.start).max(1) as usize)
+                    ));
+                }
+                json_diag.location = Some(loc.clone());
+
+                // Add suggestions based on error code
+                match code {
+                    ErrorCode::BorrowOfMovedValue | ErrorCode::UseAfterMove => {
+                        // Extract variable name from message (format: "use of moved value: `name`")
+                        let var_name = diag.message
+                            .split('`')
+                            .nth(1)
+                            .unwrap_or("value");
+                        json_diag.help = Some(format!(
+                            "consider cloning `{}` if you need to use it after the move",
+                            var_name
+                        ));
+                        json_diag.suggestions.push(Suggestion {
+                            message: "clone the value before moving".to_string(),
+                            replacement: format!("{}.clone()", var_name),
+                            location: loc,
+                            confidence: SuggestionConfidence::Medium,
+                        });
+                    }
+                    ErrorCode::MutableBorrowConflict => {
+                        json_diag.help = Some(
+                            "consider using a block to limit the scope of the first borrow".to_string()
+                        );
+                    }
+                    ErrorCode::ImmutableBorrowConflict => {
+                        json_diag.help = Some(
+                            "cannot borrow as mutable while borrowed as immutable".to_string()
+                        );
+                    }
+                    ErrorCode::CannotMutateImmutable => {
+                        json_diag.help = Some(
+                            "consider changing this to `let mut` to make it mutable".to_string()
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Add notes
+        json_diag.notes = diag.notes;
+
+        json_diag
+    }
+
+    /// Create a rich borrow error with move information
+    pub fn borrow_error(
+        message: &str,
+        error_span: Option<Span>,
+        moved_span: Option<Span>,
+        type_name: Option<&str>,
+    ) -> Self {
+        let mut diag = Self::error(ErrorCode::BorrowOfMovedValue, message);
+
+        // Add primary location
+        if let Some(span) = error_span {
+            if let Some(loc) = source_map().span_to_location(span) {
+                if let Some(line) = source_map().get_line_for_span(span) {
+                    diag.source_snippet = Some(format!(
+                        "{:4} | {}\n     | {}{}",
+                        loc.line,
+                        line,
+                        " ".repeat(loc.column.saturating_sub(1)),
+                        "^".repeat((span.end - span.start).max(1) as usize)
+                    ));
+                }
+                diag.location = Some(loc);
+            }
+        }
+
+        // Add label for where the move occurred
+        if let Some(span) = moved_span {
+            if let Some(loc) = source_map().span_to_location(span) {
+                diag.labels.push(Label {
+                    message: "value moved here".to_string(),
+                    location: loc,
+                    primary: false,
+                });
+            }
+        }
+
+        // Add type information
+        if let Some(ty) = type_name {
+            diag.notes.push(format!(
+                "move occurs because `{}` has type `{}`, which does not implement `Copy`",
+                message.split('`').nth(1).unwrap_or("value"),
+                ty
+            ));
+        }
+
+        // Add suggestion
+        diag.help = Some("consider cloning the value if the performance cost is acceptable".to_string());
+        if let Some(span) = moved_span {
+            if let Some(loc) = source_map().span_to_location(span) {
+                diag.suggestions.push(Suggestion {
+                    message: "consider cloning the value".to_string(),
+                    replacement: ".clone()".to_string(),
+                    location: loc,
+                    confidence: SuggestionConfidence::Medium,
+                });
+            }
+        }
+
+        diag
+    }
+
+    /// Format for human-readable terminal output (colored)
+    pub fn format_human(&self) -> String {
+        let mut output = String::new();
+
+        // Error header with code
+        let level_str = match self.level {
+            DiagnosticLevel::Error => "error",
+            DiagnosticLevel::Warning => "warning",
+            DiagnosticLevel::Note => "note",
+        };
+        output.push_str(&format!("{}[{}]: {}\n", level_str, self.code.code(), self.message));
+
+        // Location
+        if let Some(ref loc) = self.location {
+            output.push_str(&format!(" --> {}:{}:{}\n", loc.file.display(), loc.line, loc.column));
+        }
+
+        // Source snippet
+        if let Some(ref snippet) = self.source_snippet {
+            output.push_str("  |\n");
+            for line in snippet.lines() {
+                output.push_str(&format!("  {}\n", line));
+            }
+            output.push_str("  |\n");
+        }
+
+        // Labels
+        for label in &self.labels {
+            output.push_str(&format!(
+                "  = {}: {}:{}:{}\n",
+                label.message,
+                label.location.file.display(),
+                label.location.line,
+                label.location.column
+            ));
+        }
+
+        // Notes
+        for note in &self.notes {
+            output.push_str(&format!("  = note: {}\n", note));
+        }
+
+        // Help
+        if let Some(ref help) = self.help {
+            output.push_str(&format!("  = help: {}\n", help));
+        }
+
+        // Suggestions
+        for suggestion in &self.suggestions {
+            output.push_str(&format!(
+                "  = suggestion: {} `{}`\n",
+                suggestion.message,
+                suggestion.replacement
+            ));
+        }
+
+        output
     }
 }
 

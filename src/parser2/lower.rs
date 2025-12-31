@@ -27,15 +27,18 @@ pub struct LowerContext {
     next_def_id: u32,
     /// Current module path prefix
     module_prefix: String,
+    /// File ID for span conversion
+    file_id: u32,
 }
 
 impl LowerContext {
-    pub fn new(crate_name: String) -> Self {
+    pub fn new(crate_name: String, file_id: u32) -> Self {
         Self {
             hir_crate: Crate::new(crate_name),
             def_ids: HashMap::new(),
             next_def_id: 0,
             module_prefix: String::new(),
+            file_id,
         }
     }
 
@@ -48,7 +51,7 @@ impl LowerContext {
 
     /// Convert lexer span to HIR span
     fn convert_span(&self, span: LexerSpan) -> HirSpan {
-        HirSpan::new(0, span.start, span.end)
+        HirSpan::new(self.file_id, span.start, span.end)
     }
 
     /// Lower a complete source file to HIR
@@ -1162,6 +1165,11 @@ impl LowerContext {
 
 /// Parse and lower source code to HIR using parser2
 pub fn parse_and_lower(source: &str, crate_name: &str) -> Result<Crate, Vec<String>> {
+    parse_and_lower_with_file_id(source, crate_name, 0)
+}
+
+/// Parse and lower with a specific file_id for span tracking
+pub fn parse_and_lower_with_file_id(source: &str, crate_name: &str, file_id: u32) -> Result<Crate, Vec<String>> {
     let (ast, errors) = crate::parser2::parse(source);
 
     if !errors.is_empty() {
@@ -1173,7 +1181,7 @@ pub fn parse_and_lower(source: &str, crate_name: &str) -> Result<Crate, Vec<Stri
 
     match ast {
         Some(source_file) => {
-            let mut ctx = LowerContext::new(crate_name.to_string());
+            let mut ctx = LowerContext::new(crate_name.to_string(), file_id);
             ctx.lower_source_file(&source_file);
             Ok(ctx.hir_crate)
         }

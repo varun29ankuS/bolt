@@ -68,9 +68,20 @@ impl<'a> Lowerer<'a> {
         false
     }
 
-    fn span(&self, _s: proc_macro2::Span) -> Span {
-        // Use dummy span - proc_macro2 span position requires special features
-        Span::new(self.file_id, 0, 0)
+    fn span(&self, s: proc_macro2::Span) -> Span {
+        // Use proc_macro2 span-locations feature to get line/column
+        let start = s.start();
+        let end = s.end();
+
+        // Convert line/column to byte offset using the global source map
+        if let Some(source_file) = crate::error::source_map().get_file(self.file_id) {
+            let start_offset = source_file.line_col_to_offset(start.line, start.column + 1);
+            let end_offset = source_file.line_col_to_offset(end.line, end.column + 1);
+            Span::new(self.file_id, start_offset, end_offset)
+        } else {
+            // Fallback if source file not in map
+            Span::new(self.file_id, 0, 0)
+        }
     }
 
     fn alloc_def_id(&self) -> DefId {

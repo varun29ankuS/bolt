@@ -148,7 +148,18 @@ impl Parser {
 
     fn parse_file(&self, path: &Path, krate: &mut Crate) -> Result<()> {
         let content = std::fs::read_to_string(path)?;
+
+        // Use global source map for rich error reporting
+        // Try to get existing file_id or load it
+        let global_file_id = crate::error::source_map()
+            .get_file_id(&path.to_path_buf())
+            .unwrap_or_else(|| {
+                crate::error::source_map().add_source(path.to_path_buf(), content.clone())
+            });
+
+        // Also add to local source map for backward compatibility
         let file_id = self.source_map.add_file(path.to_path_buf(), content.clone());
+        let _ = file_id; // Use global_file_id instead
 
         let syn_file = syn::parse_file(&content).map_err(|e| BoltError::Parse {
             file: path.to_path_buf(),
@@ -157,7 +168,7 @@ impl Parser {
             message: e.to_string(),
         })?;
 
-        let lowerer = lower::Lowerer::new(self, file_id, path.to_path_buf());
+        let lowerer = lower::Lowerer::new(self, global_file_id, path.to_path_buf());
         lowerer.lower_file(&syn_file, krate);
 
         Ok(())
