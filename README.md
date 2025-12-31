@@ -1,5 +1,8 @@
 # Bolt ⚡
 
+[![Crates.io](https://img.shields.io/crates/v/bolt-rs.svg)](https://crates.io/crates/bolt-rs)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 **Lightning-fast Rust type checker for rapid development.**
 
 Get instant feedback on your Rust code. Bolt checks your source files in milliseconds by using stubs for external crates instead of compiling them.
