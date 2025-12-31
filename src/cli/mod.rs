@@ -560,11 +560,28 @@ fn build_file(path: &PathBuf, _output: Option<&std::path::Path>, release: bool, 
 
     // Extract type aliases for borrow checker to resolve Copy types correctly
     let type_alias_map = registry.get_type_alias_map();
-    let borrow_checker = crate::borrowck::BorrowChecker::with_type_aliases(type_alias_map);
+
+    // Run both fast heuristic checker and full NLL analysis for maximum accuracy
+    let borrow_checker = crate::borrowck::BorrowChecker::with_type_aliases(type_alias_map.clone());
     borrow_checker.check_crate(&krate);
-    if borrow_checker.has_errors() {
-        let diagnostics: Vec<JsonDiagnostic> = borrow_checker
-            .take_diagnostics()
+    let fast_diags = borrow_checker.take_diagnostics();
+
+    // Full NLL analysis (CFG-based, catches more edge cases)
+    let nll_checker = crate::borrowck::NllChecker::new();
+    nll_checker.check_crate(&krate);
+    let nll_diags = nll_checker.take_diagnostics();
+
+    // Merge and deduplicate diagnostics
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut all_diags = Vec::new();
+    for d in fast_diags.into_iter().chain(nll_diags.into_iter()) {
+        if seen.insert(d.message.clone()) {
+            all_diags.push(d);
+        }
+    }
+
+    if !all_diags.is_empty() {
+        let diagnostics: Vec<JsonDiagnostic> = all_diags
             .into_iter()
             .map(|d| {
                 JsonDiagnostic::error(ErrorCode::BorrowOfMovedValue, &d.message)
@@ -660,11 +677,28 @@ fn check_file(path: &PathBuf, format: OutputFormat, parser_backend: ParserBacken
     let borrow_start = Instant::now();
     // Extract type aliases for borrow checker to resolve Copy types correctly
     let type_alias_map = registry.get_type_alias_map();
-    let borrow_checker = crate::borrowck::BorrowChecker::with_type_aliases(type_alias_map);
+
+    // Run both fast heuristic checker and full NLL analysis for maximum accuracy
+    let borrow_checker = crate::borrowck::BorrowChecker::with_type_aliases(type_alias_map.clone());
     borrow_checker.check_crate(&krate);
+    let fast_diags = borrow_checker.take_diagnostics();
+
+    // Full NLL analysis (CFG-based, catches more edge cases)
+    let nll_checker = crate::borrowck::NllChecker::new();
+    nll_checker.check_crate(&krate);
+    let nll_diags = nll_checker.take_diagnostics();
+
+    // Merge and deduplicate diagnostics
+    let mut seen_msgs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut all_borrow_diags = Vec::new();
+    for d in fast_diags.into_iter().chain(nll_diags.into_iter()) {
+        if seen_msgs.insert(d.message.clone()) {
+            all_borrow_diags.push(d);
+        }
+    }
     let borrow_time = borrow_start.elapsed();
 
-    let has_errors = type_ctx.has_errors() || borrow_checker.has_errors();
+    let has_errors = type_ctx.has_errors() || !all_borrow_diags.is_empty();
 
     if has_errors {
         // Collect type checker diagnostics
@@ -676,9 +710,8 @@ fn check_file(path: &PathBuf, format: OutputFormat, parser_backend: ParserBacken
                     .with_notes_from_vec(d.notes)
             })
             .collect();
-        // Collect borrow checker diagnostics
-        diagnostics.extend(borrow_checker
-            .take_diagnostics()
+        // Collect borrow checker diagnostics (already merged fast + NLL)
+        diagnostics.extend(all_borrow_diags
             .into_iter()
             .map(|d| {
                 JsonDiagnostic::error(ErrorCode::BorrowOfMovedValue, &d.message)

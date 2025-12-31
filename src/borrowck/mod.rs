@@ -1,7 +1,10 @@
 //! Borrow checker for Bolt
 //!
-//! Simplified borrow checking focusing on common patterns.
-//! Full NLL (Non-Lexical Lifetimes) is out of scope for MVP.
+//! Implements ownership and borrowing rules:
+//! - Move semantics for non-Copy types
+//! - Borrow scope tracking (when references expire)
+//! - Partial move tracking for struct fields
+//! - Mutable borrow exclusivity
 //!
 //! ## Ownership Ledger (Blockchain-inspired)
 //!
@@ -11,7 +14,7 @@
 //! - LLM-friendly JSON output
 //! - Visual history for error messages
 //!
-//! ## Async Mode (BOL-14)
+//! ## Async Mode
 //!
 //! The async_checker module provides background borrow checking:
 //! - Code runs immediately without waiting for borrow check
@@ -21,32 +24,75 @@
 
 pub mod async_checker;
 pub mod ledger;
+pub mod nll;
 
 pub use async_checker::{global_checker, AsyncBorrowChecker, CheckResult};
+pub use nll::NllChecker;
 
 use crate::error::{Diagnostic, DiagnosticEmitter, Span};
 use crate::hir::*;
 use indexmap::IndexMap;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Type alias resolution map: alias_name -> resolved_base_type
 /// e.g., "DefId" -> "u32", "TypeId" -> "u32"
 pub type TypeAliasMap = HashMap<String, String>;
 
+/// A place is a path to a memory location: `x`, `x.field`, `x.0`, `(*x).field`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Place {
+    /// Root variable name
+    pub base: String,
+    /// Field projections (field names or tuple indices as strings)
+    pub projections: Vec<String>,
+}
+
+impl Place {
+    pub fn new(base: String) -> Self {
+        Self { base, projections: vec![] }
+    }
+
+    pub fn with_field(mut self, field: String) -> Self {
+        self.projections.push(field);
+        self
+    }
+
+    /// Check if this place is a prefix of another (for partial moves)
+    pub fn is_prefix_of(&self, other: &Place) -> bool {
+        if self.base != other.base {
+            return false;
+        }
+        if self.projections.len() > other.projections.len() {
+            return false;
+        }
+        self.projections.iter().zip(&other.projections).all(|(a, b)| a == b)
+    }
+
+    pub fn display(&self) -> String {
+        if self.projections.is_empty() {
+            self.base.clone()
+        } else {
+            format!("{}.{}", self.base, self.projections.join("."))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BorrowKind {
     Shared,
     Mutable,
-    Move,
 }
 
+/// An active borrow of a place
 #[derive(Debug, Clone)]
-pub struct BorrowInfo {
+pub struct Borrow {
+    pub place: Place,
     pub kind: BorrowKind,
     pub span: Span,
-    pub live: bool,
+    /// Scope ID where this borrow was created
+    pub scope_id: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,14 +100,14 @@ pub enum PlaceState {
     Valid,
     Moved,
     PartiallyMoved,
-    Borrowed,
-    MutablyBorrowed,
 }
 
 pub struct BorrowChecker {
     diagnostics: RwLock<DiagnosticEmitter>,
     /// Type alias map for resolving Copy types correctly
     type_aliases: Arc<TypeAliasMap>,
+    /// Set of type names known to be Copy
+    copy_types: Arc<HashSet<String>>,
 }
 
 impl BorrowChecker {
@@ -69,6 +115,7 @@ impl BorrowChecker {
         Self {
             diagnostics: RwLock::new(DiagnosticEmitter::new()),
             type_aliases: Arc::new(HashMap::new()),
+            copy_types: Arc::new(Self::default_copy_types()),
         }
     }
 
@@ -77,13 +124,44 @@ impl BorrowChecker {
         Self {
             diagnostics: RwLock::new(DiagnosticEmitter::new()),
             type_aliases: Arc::new(type_aliases),
+            copy_types: Arc::new(Self::default_copy_types()),
         }
+    }
+
+    /// Create a borrow checker with full type information
+    pub fn with_type_info(type_aliases: TypeAliasMap, copy_types: HashSet<String>) -> Self {
+        let mut all_copy = Self::default_copy_types();
+        all_copy.extend(copy_types);
+        Self {
+            diagnostics: RwLock::new(DiagnosticEmitter::new()),
+            type_aliases: Arc::new(type_aliases),
+            copy_types: Arc::new(all_copy),
+        }
+    }
+
+    /// Default set of Copy types (primitives + common types)
+    fn default_copy_types() -> HashSet<String> {
+        let mut copy = HashSet::new();
+        // Primitives
+        for t in &["i8", "i16", "i32", "i64", "i128", "isize",
+                   "u8", "u16", "u32", "u64", "u128", "usize",
+                   "f32", "f64", "bool", "char", "()", "!"] {
+            copy.insert(t.to_string());
+        }
+        // Bolt's internal Copy types
+        for t in &["Span", "DefId", "HirId", "TypeId", "TyId", "LifetimeId",
+                   "IntType", "UintType", "FloatType", "BinaryOp", "UnaryOp",
+                   "BorrowKind", "PlaceState", "EventType", "ValueState", "Location",
+                   "Ordering"] {
+            copy.insert(t.to_string());
+        }
+        copy
     }
 
     /// Resolve a type name through any aliases to its base type
     fn resolve_type_alias(&self, type_name: &str) -> String {
         let mut current = type_name.to_string();
-        let mut visited = std::collections::HashSet::new();
+        let mut visited = HashSet::new();
 
         // Follow aliases until we hit a non-alias or cycle
         while let Some(resolved) = self.type_aliases.get(&current) {
@@ -96,10 +174,32 @@ impl BorrowChecker {
         current
     }
 
-    /// Check if a type is Copy, resolving type aliases first
-    fn is_copy_type_resolved(&self, type_name: &str) -> bool {
+    /// Check if a type is Copy
+    fn is_copy_type(&self, type_name: &str) -> bool {
+        // First resolve any aliases
         let resolved = self.resolve_type_alias(type_name);
-        is_copy_type(&resolved)
+
+        // Check if it's in our known Copy types
+        if self.copy_types.contains(&resolved) {
+            return true;
+        }
+
+        // References and raw pointers are always Copy
+        if resolved.starts_with('&') || resolved.starts_with('*') {
+            return true;
+        }
+
+        // Types ending in Id are usually Copy (DefId, TyId, FuncId, etc.)
+        if resolved.ends_with("Id") {
+            return true;
+        }
+
+        // Check for "copy_struct" marker from TypeRegistry
+        if resolved == "copy_struct" {
+            return true;
+        }
+
+        false
     }
 
     pub fn check_crate(&self, krate: &Crate) {
@@ -141,7 +241,9 @@ impl BorrowChecker {
         match &stmt.kind {
             StmtKind::Let { pattern, ty, init } => {
                 if let Some(init) = init {
-                    self.check_expr(init, ctx, UseKind::Read);
+                    // Use Move for bindings - Copy types will be handled correctly
+                    // by the Move handler (they just get copied without state change)
+                    self.check_expr(init, ctx, UseKind::Move);
                 }
                 // Extract type name for Copy checking - try annotation first, then infer from init
                 let type_name = ty.as_ref()
@@ -200,6 +302,38 @@ impl BorrowChecker {
             ExprKind::If { then_branch, .. } => {
                 then_branch.expr.as_ref().and_then(|e| self.infer_expr_type(e))
             },
+            // Call expressions - infer from function path
+            ExprKind::Call { func, .. } => {
+                // String::from, Vec::new, etc.
+                if let ExprKind::Path(path) = &func.kind {
+                    let full_path: String = path.segments.iter()
+                        .map(|s| s.ident.clone())
+                        .collect::<Vec<_>>()
+                        .join("::");
+                    // Return type inference for common constructors
+                    if full_path.starts_with("String::") {
+                        return Some("String".to_string());
+                    }
+                    if full_path.starts_with("Vec::") {
+                        return Some("Vec".to_string());
+                    }
+                    if full_path.starts_with("Box::") {
+                        return Some("Box".to_string());
+                    }
+                    if full_path.starts_with("HashMap::") || full_path.starts_with("HashSet::") {
+                        return Some(path.segments[0].ident.clone());
+                    }
+                    // Return the type name if it looks like Type::method
+                    if path.segments.len() >= 2 {
+                        let type_name = &path.segments[0].ident;
+                        // Check if first segment is capitalized (type name)
+                        if type_name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                            return Some(type_name.clone());
+                        }
+                    }
+                }
+                None
+            },
             _ => None,
         }
     }
@@ -233,22 +367,37 @@ impl BorrowChecker {
             ExprKind::Path(path) => {
                 if path.segments.len() == 1 {
                     let name = &path.segments[0].ident;
+                    let place = Place::new(name.clone());
+
                     match use_kind {
                         UseKind::Read => {
-                            if let Some(local) = ctx.locals.get(name) {
-                                if local.state == PlaceState::Moved {
+                            // Check if moved
+                            if ctx.is_place_moved(&place) {
+                                if let Some(local) = ctx.locals.get(name) {
                                     self.diagnostics.write().emit(
                                         Diagnostic::error(format!(
-                                            "Use of moved value: `{}`",
+                                            "use of moved value: `{}`",
                                             name
                                         ))
                                         .with_span(expr.span)
                                         .with_note(format!(
-                                            "Value moved here: {:?}",
+                                            "value moved here: {:?}",
                                             local.moved_span
-                                        )),
+                                        ))
+                                        .with_note("move occurs because value has type that doesn't implement Copy"),
                                     );
                                 }
+                            }
+                            // Check for mutable borrow conflict
+                            if let Some(borrow) = ctx.is_mutably_borrowed(&place) {
+                                self.diagnostics.write().emit(
+                                    Diagnostic::error(format!(
+                                        "cannot use `{}` because it was mutably borrowed",
+                                        name
+                                    ))
+                                    .with_span(expr.span)
+                                    .with_note(format!("mutable borrow occurs here: {:?}", borrow.span)),
+                                );
                             }
                         }
                         UseKind::Write => {
@@ -256,84 +405,132 @@ impl BorrowChecker {
                                 if !local.mutable {
                                     self.diagnostics.write().emit(
                                         Diagnostic::error(format!(
-                                            "Cannot assign to immutable variable `{}`",
+                                            "cannot assign to immutable variable `{}`",
                                             name
                                         ))
-                                        .with_span(expr.span),
+                                        .with_span(expr.span)
+                                        .with_note("consider making this binding mutable: `mut`"),
                                     );
                                 }
                             }
+                            // Check for any active borrow (shared or mutable)
+                            if let Some(borrow) = ctx.is_borrowed(&place) {
+                                self.diagnostics.write().emit(
+                                    Diagnostic::error(format!(
+                                        "cannot assign to `{}` because it is borrowed",
+                                        name
+                                    ))
+                                    .with_span(expr.span)
+                                    .with_note(format!("borrow occurs here: {:?}", borrow.span)),
+                                );
+                            }
                         }
                         UseKind::Move => {
-                            if let Some(local) = ctx.locals.get_mut(name) {
-                                // Check if type is Copy - Copy types don't need move semantics
-                                // Resolves type aliases (e.g., DefId -> u32) before checking
+                            // Check if already moved
+                            if ctx.is_place_moved(&place) {
+                                self.diagnostics.write().emit(
+                                    Diagnostic::error(format!(
+                                        "use of moved value: `{}`",
+                                        name
+                                    ))
+                                    .with_span(expr.span)
+                                    .with_note("value used here after move"),
+                                );
+                            } else if let Some(local) = ctx.locals.get(name) {
+                                // Check if type is Copy
                                 let is_copy = local.type_name.as_ref()
-                                    .map(|t| self.is_copy_type_resolved(t))
+                                    .map(|t| self.is_copy_type(t))
                                     .unwrap_or(false)
                                     // Fallback: use naming convention heuristics when no type info
                                     || is_likely_copy_var_name(name);
 
-                                if local.state == PlaceState::Moved {
-                                    self.diagnostics.write().emit(
-                                        Diagnostic::error(format!(
-                                            "Use of moved value: `{}`",
-                                            name
-                                        ))
-                                        .with_span(expr.span),
-                                    );
-                                } else if !is_copy {
-                                    // Only mark as moved if not a Copy type
-                                    local.state = PlaceState::Moved;
-                                    local.moved_span = Some(expr.span);
+                                if !is_copy {
+                                    // Check for active borrows before moving
+                                    if let Some(borrow) = ctx.is_borrowed(&place) {
+                                        self.diagnostics.write().emit(
+                                            Diagnostic::error(format!(
+                                                "cannot move out of `{}` because it is borrowed",
+                                                name
+                                            ))
+                                            .with_span(expr.span)
+                                            .with_note(format!("borrow occurs here: {:?}", borrow.span)),
+                                        );
+                                    } else {
+                                        // Mark as moved
+                                        ctx.mark_moved(place, expr.span);
+                                    }
                                 }
                                 // Copy types just get copied, no state change needed
                             }
                         }
                         UseKind::Borrow => {
-                            if let Some(local) = ctx.locals.get_mut(name) {
-                                if local.state == PlaceState::Moved {
+                            // Check if moved
+                            if ctx.is_place_moved(&place) {
+                                self.diagnostics.write().emit(
+                                    Diagnostic::error(format!(
+                                        "cannot borrow `{}` as it was moved",
+                                        name
+                                    ))
+                                    .with_span(expr.span),
+                                );
+                            } else {
+                                // Check for mutable borrow conflict
+                                if let Some(borrow) = ctx.is_mutably_borrowed(&place) {
                                     self.diagnostics.write().emit(
                                         Diagnostic::error(format!(
-                                            "Cannot borrow moved value: `{}`",
+                                            "cannot borrow `{}` as immutable because it is also borrowed as mutable",
                                             name
                                         ))
-                                        .with_span(expr.span),
+                                        .with_span(expr.span)
+                                        .with_note(format!("mutable borrow occurs here: {:?}", borrow.span)),
                                     );
+                                } else {
+                                    // Add shared borrow
+                                    ctx.add_borrow(place, BorrowKind::Shared, expr.span);
                                 }
-                                // Note: For self-hosting, we don't track borrow states strictly.
-                                // Full NLL would require tracking borrow scopes properly.
-                                // This is acceptable for a development compiler - rustc is the fallback.
                             }
                         }
                         UseKind::MutBorrow => {
-                            if let Some(local) = ctx.locals.get_mut(name) {
-                                if local.state == PlaceState::Moved {
-                                    self.diagnostics.write().emit(
-                                        Diagnostic::error(format!(
-                                            "Cannot borrow moved value: `{}`",
-                                            name
-                                        ))
-                                        .with_span(expr.span),
-                                    );
-                                } else if !local.mutable {
-                                    // Skip mutability check for raw pointer types - they can be dereferenced
-                                    // and written through without requiring a mutable binding
+                            // Check if moved
+                            if ctx.is_place_moved(&place) {
+                                self.diagnostics.write().emit(
+                                    Diagnostic::error(format!(
+                                        "cannot borrow `{}` as mutable because it was moved",
+                                        name
+                                    ))
+                                    .with_span(expr.span),
+                                );
+                            } else if let Some(local) = ctx.locals.get(name) {
+                                if !local.mutable {
+                                    // Skip mutability check for raw pointer types
                                     let is_raw_ptr = local.type_name.as_ref()
-                                        .map(|t| t == "*" || t.starts_with("*"))
+                                        .map(|t| t.starts_with('*'))
                                         .unwrap_or(false);
                                     if !is_raw_ptr {
                                         self.diagnostics.write().emit(
                                             Diagnostic::error(format!(
-                                                "Cannot borrow `{}` as mutable, as it is not declared as mutable",
+                                                "cannot borrow `{}` as mutable, as it is not declared as mutable",
                                                 name
                                             ))
-                                            .with_span(expr.span),
+                                            .with_span(expr.span)
+                                            .with_note("consider changing this to be mutable: `mut`"),
                                         );
                                     }
                                 }
-                                // Note: For self-hosting, we don't track borrow states strictly.
-                                // Full NLL would require tracking borrow scopes properly.
+                                // Check for any existing borrow conflict
+                                if let Some(borrow) = ctx.is_borrowed(&place) {
+                                    self.diagnostics.write().emit(
+                                        Diagnostic::error(format!(
+                                            "cannot borrow `{}` as mutable because it is already borrowed",
+                                            name
+                                        ))
+                                        .with_span(expr.span)
+                                        .with_note(format!("previous borrow occurs here: {:?}", borrow.span)),
+                                    );
+                                } else {
+                                    // Add mutable borrow
+                                    ctx.add_borrow(place, BorrowKind::Mutable, expr.span);
+                                }
                             }
                         }
                     }
@@ -526,6 +723,12 @@ struct BorrowContext {
     function_name: String,
     locals: IndexMap<String, LocalInfo>,
     scope_stack: Vec<Vec<String>>,
+    /// Active borrows with their scope information
+    active_borrows: Vec<Borrow>,
+    /// Current scope ID (incremented on each new scope)
+    current_scope: usize,
+    /// Moved places (for partial move tracking)
+    moved_places: HashSet<Place>,
 }
 
 impl BorrowContext {
@@ -700,20 +903,27 @@ impl BorrowContext {
             function_name: function_name.to_string(),
             locals: IndexMap::new(),
             scope_stack: vec![Vec::new()],
+            active_borrows: Vec::new(),
+            current_scope: 0,
+            moved_places: HashSet::new(),
         }
     }
 
     fn enter_scope(&mut self) -> usize {
         self.scope_stack.push(Vec::new());
-        self.scope_stack.len() - 1
+        self.current_scope += 1;
+        self.current_scope
     }
 
     fn exit_scope(&mut self, scope_id: usize) {
+        // Remove locals introduced in this scope
         if let Some(names) = self.scope_stack.pop() {
             for name in names {
                 self.locals.shift_remove(&name);
             }
         }
+        // End borrows that were created in this scope
+        self.active_borrows.retain(|b| b.scope_id < scope_id);
     }
 
     fn introduce_local(&mut self, name: String, mutable: bool, span: Span, type_name: Option<String>) {
@@ -730,5 +940,61 @@ impl BorrowContext {
         if let Some(scope) = self.scope_stack.last_mut() {
             scope.push(name);
         }
+    }
+
+    /// Add a borrow of a place
+    fn add_borrow(&mut self, place: Place, kind: BorrowKind, span: Span) {
+        self.active_borrows.push(Borrow {
+            place,
+            kind,
+            span,
+            scope_id: self.current_scope,
+        });
+    }
+
+    /// Check if a place is currently borrowed (shared or mutable)
+    fn is_borrowed(&self, place: &Place) -> Option<&Borrow> {
+        self.active_borrows.iter().find(|b| {
+            // A borrow of `a` conflicts with use of `a`, `a.x`, etc.
+            // A borrow of `a.x` conflicts with use of `a` or `a.x`
+            b.place.is_prefix_of(place) || place.is_prefix_of(&b.place)
+        })
+    }
+
+    /// Check if a place is mutably borrowed
+    fn is_mutably_borrowed(&self, place: &Place) -> Option<&Borrow> {
+        self.active_borrows.iter().find(|b| {
+            b.kind == BorrowKind::Mutable &&
+            (b.place.is_prefix_of(place) || place.is_prefix_of(&b.place))
+        })
+    }
+
+    /// Check if a place or any of its parents have been moved
+    fn is_place_moved(&self, place: &Place) -> bool {
+        // Check if exact place is moved
+        if self.moved_places.contains(place) {
+            return true;
+        }
+        // Check if any parent is moved (e.g., if `a` is moved, `a.x` is also moved)
+        for moved in &self.moved_places {
+            if moved.is_prefix_of(place) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Mark a place as moved
+    fn mark_moved(&mut self, place: Place, span: Span) {
+        // Update the local info for the base variable
+        if let Some(info) = self.locals.get_mut(&place.base) {
+            if place.projections.is_empty() {
+                info.state = PlaceState::Moved;
+            } else {
+                info.state = PlaceState::PartiallyMoved;
+            }
+            info.moved_span = Some(span);
+        }
+        self.moved_places.insert(place);
     }
 }

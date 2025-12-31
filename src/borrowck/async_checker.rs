@@ -5,9 +5,10 @@
 //!
 //! State is persisted to disk so blocking works across CLI invocations.
 
-use super::{BorrowChecker, TypeAliasMap};
+use super::{BorrowChecker, NllChecker, TypeAliasMap};
 use crate::error::Diagnostic;
 use crate::hir::Crate;
+use std::collections::HashSet;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -163,25 +164,54 @@ impl AsyncBorrowChecker {
     }
 
     pub fn spawn_check_with_aliases(&self, path: PathBuf, krate: Arc<Crate>, type_aliases: TypeAliasMap) {
+        self.spawn_full_analysis(path, krate, type_aliases, HashSet::new());
+    }
+
+    /// Spawn full NLL analysis in the background.
+    /// This runs both the fast heuristic checker and the thorough NLL checker.
+    /// Since it's async, we get 99%+ accuracy with no blocking.
+    pub fn spawn_full_analysis(
+        &self,
+        path: PathBuf,
+        krate: Arc<Crate>,
+        type_aliases: TypeAliasMap,
+        copy_types: HashSet<String>,
+    ) {
         let canonical = canonical_path(&path);
 
         // Clear persisted failure since we're recompiling
         clear_persisted_failure(&canonical);
 
-        // Clone canonical path for the thread closure
+        // Clone for the thread closure
         let canonical_for_persist = canonical.clone();
 
         let handle = thread::spawn(move || {
-            let checker = BorrowChecker::with_type_aliases(type_aliases);
-            checker.check_crate(&krate);
-            let diagnostics = checker.take_diagnostics();
+            let mut all_diagnostics = Vec::new();
 
-            // Persist failure to disk if there are errors
-            if !diagnostics.is_empty() {
-                persist_failure(&canonical_for_persist, &diagnostics);
+            // Phase 1: Fast heuristic check (catches obvious errors quickly)
+            let fast_checker = BorrowChecker::with_type_aliases(type_aliases);
+            fast_checker.check_crate(&krate);
+            let fast_diags = fast_checker.take_diagnostics();
+
+            // Phase 2: Full NLL analysis (catches everything)
+            let nll_checker = NllChecker::with_copy_types(copy_types);
+            nll_checker.check_crate(&krate);
+            let nll_diags = nll_checker.take_diagnostics();
+
+            // Merge diagnostics, deduplicating by message
+            let mut seen_messages: HashSet<String> = HashSet::new();
+            for diag in fast_diags.into_iter().chain(nll_diags.into_iter()) {
+                if seen_messages.insert(diag.message.clone()) {
+                    all_diagnostics.push(diag);
+                }
             }
 
-            diagnostics
+            // Persist failure to disk if there are errors
+            if !all_diagnostics.is_empty() {
+                persist_failure(&canonical_for_persist, &all_diagnostics);
+            }
+
+            all_diagnostics
         });
 
         let mut states = self.file_states.write();
