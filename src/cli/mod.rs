@@ -13,15 +13,27 @@ use std::sync::Arc;
 
 #[derive(ClapParser)]
 #[command(name = "bolt")]
-#[command(about = "⚡ Lightning-fast Rust compiler for development ⚡")]
+#[command(about = "⚡ Lightning-fast Rust type checker - 10-100x faster than cargo check")]
 #[command(version)]
-#[command(after_help = "Examples:
-  bolt run main.rs          ⚡ Compile and run instantly
-  bolt check src/lib.rs     ⚡ Type-check without codegen
-  bolt watch src/ --run     ⚡ Auto-recompile on changes
-  bolt build main.rs        ⚡ Build executable
+#[command(long_about = "Bolt is a fast type checker for Rust, optimized for the edit-check loop.
 
-Speed: ~25x faster than rustc for development builds")]
+Get instant feedback on your code in milliseconds instead of seconds.
+Use rustc/cargo for production builds - use Bolt for development speed.")]
+#[command(after_help = "EXAMPLES:
+    bolt check .              Type-check entire project (auto-detects Cargo.toml)
+    bolt check src/lib.rs     Type-check a single file
+    bolt check . -f json      JSON output for IDE/tooling integration
+    bolt run main.rs          Compile and run instantly
+    bolt watch src/ --run     Auto-recompile on file changes
+
+TYPICAL WORKFLOW:
+    1. Write code
+    2. bolt check .           (~400ms feedback)
+    3. Fix errors
+    4. bolt check .           (~400ms feedback)
+    5. cargo build --release  (final production build)
+
+More info: https://github.com/varun29ankuS/bolt")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -69,7 +81,7 @@ pub enum Commands {
         sync_borrow: bool,
 
         /// Parser backend to use
-        #[arg(long, short = 'p', value_enum, default_value_t = ParserBackend::Chumsky)]
+        #[arg(long, short = 'p', value_enum, default_value_t = ParserBackend::Syn)]
         parser: ParserBackend,
     },
 
@@ -91,7 +103,7 @@ pub enum Commands {
         format: OutputFormat,
 
         /// Parser backend to use
-        #[arg(long, short = 'p', value_enum, default_value_t = ParserBackend::Chumsky)]
+        #[arg(long, short = 'p', value_enum, default_value_t = ParserBackend::Syn)]
         parser: ParserBackend,
     },
 
@@ -105,7 +117,7 @@ pub enum Commands {
         format: OutputFormat,
 
         /// Parser backend to use
-        #[arg(long, short = 'p', value_enum, default_value_t = ParserBackend::Chumsky)]
+        #[arg(long, short = 'p', value_enum, default_value_t = ParserBackend::Syn)]
         parser: ParserBackend,
     },
 
@@ -129,7 +141,7 @@ pub enum Commands {
         run: bool,
 
         /// Parser backend to use
-        #[arg(long, short = 'p', value_enum, default_value_t = ParserBackend::Chumsky)]
+        #[arg(long, short = 'p', value_enum, default_value_t = ParserBackend::Syn)]
         parser: ParserBackend,
     },
 }
@@ -593,14 +605,41 @@ fn build_file(path: &PathBuf, _output: Option<&std::path::Path>, release: bool, 
 fn check_file(path: &PathBuf, format: OutputFormat, parser_backend: ParserBackend) {
     let start = Instant::now();
 
-    if matches!(format, OutputFormat::Human) {
-        println!("{} {} {}", "⚡".yellow(), "Checking".cyan().bold(), path.display());
-    }
+    // Resolve project - handles directories, Cargo.toml, or direct .rs files
+    let (entry_point, project_name) = if path.is_dir() || !path.extension().map(|e| e == "rs").unwrap_or(false) {
+        match crate::cargo::resolve_project(path) {
+            Ok(project) => {
+                if matches!(format, OutputFormat::Human) {
+                    println!("{} {} {} ({})",
+                        "⚡".yellow(),
+                        "Checking".cyan().bold(),
+                        project.name.cyan(),
+                        project.entry_point.display()
+                    );
+                    if !project.dependencies.is_empty() {
+                        println!("  {} {} dependencies (stub resolution)",
+                            "⚡".yellow(),
+                            project.dependencies.len()
+                        );
+                    }
+                }
+                (project.entry_point, project.name)
+            }
+            Err(e) => {
+                emit_error_and_exit(format, ErrorCode::IoError, &e, Some(path), None, None);
+            }
+        }
+    } else {
+        if matches!(format, OutputFormat::Human) {
+            println!("{} {} {}", "⚡".yellow(), "Checking".cyan().bold(), path.display());
+        }
+        (path.clone(), path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string())
+    };
 
-    let krate = match parse_with_backend(path, parser_backend, format) {
+    let krate = match parse_with_backend(&entry_point, parser_backend, format) {
         Ok(k) => k,
         Err(e) => {
-            emit_error_and_exit(format, ErrorCode::UnexpectedToken, &e, Some(path), None, None);
+            emit_error_and_exit(format, ErrorCode::UnexpectedToken, &e, Some(&entry_point), None, None);
         }
     };
 
@@ -614,7 +653,7 @@ fn check_file(path: &PathBuf, format: OutputFormat, parser_backend: ParserBacken
     let type_ctx = crate::typeck::TypeContext::new(Arc::clone(&registry));
     let mut type_checker = crate::typeck::TypeChecker::new(&type_ctx, &krate);
     if let Err(e) = type_checker.check_crate() {
-        emit_error_and_exit(format, ErrorCode::TypeMismatch, &e.to_string(), Some(path), None, None);
+        emit_error_and_exit(format, ErrorCode::TypeMismatch, &e.to_string(), Some(&entry_point), None, None);
     }
     let type_time = type_start.elapsed();
 
@@ -645,7 +684,7 @@ fn check_file(path: &PathBuf, format: OutputFormat, parser_backend: ParserBacken
                 JsonDiagnostic::error(ErrorCode::BorrowOfMovedValue, &d.message)
                     .with_notes_from_vec(d.notes)
             }));
-        emit_diagnostics_and_exit(format, diagnostics, Some(path));
+        emit_diagnostics_and_exit(format, diagnostics, Some(&entry_point));
     }
 
     let total_time = start.elapsed();

@@ -6,7 +6,7 @@ fn main() {
     std::thread::Builder::new()
         .stack_size(STACK_SIZE)
         .spawn(|| {
-            bolt::cli::run_cli();
+            bolt_rs::cli::run_cli();
         })
         .expect("Failed to spawn thread with larger stack")
         .join()

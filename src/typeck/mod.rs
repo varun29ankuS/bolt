@@ -4,6 +4,7 @@
 
 use crate::cache::ExprCache;
 use crate::error::{Diagnostic, DiagnosticEmitter, Result, Span};
+use crate::extern_crates::{global_resolver, ResolvedItem, StubItemKind};
 use crate::hir::*;
 use crate::ty::{Lifetime, LifetimeId, Ty, TyId, TypeRegistry};
 use indexmap::IndexMap;
@@ -1341,10 +1342,48 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
-        // Multi-segment path - could be module::item or Enum::Variant
+        // Multi-segment path - could be module::item or Enum::Variant or extern::Crate
         if path.segments.len() >= 2 {
             let type_name = &path.segments[0].ident;
             let variant_name = &path.segments[1].ident;
+
+            // Check for external crate (e.g., serde::Serialize, std::Clone)
+            let resolver = global_resolver();
+            if resolver.is_external_crate(type_name) {
+                let item_path: Vec<&str> = path.segments[1..].iter()
+                    .map(|s| s.ident.as_str())
+                    .collect();
+
+                match resolver.resolve(type_name, &item_path) {
+                    ResolvedItem::Stub(stub) => {
+                        match &stub.kind {
+                            StubItemKind::Trait(_trait_stub) => {
+                                // Return a trait type - for now use DynTrait marker
+                                // In full implementation, would track trait bounds properly
+                                return Ok(self.ctx.registry.intern(Ty::DynTrait {
+                                    bounds: vec![stub.item_name.clone()],
+                                }));
+                            }
+                            StubItemKind::Type(_type_stub) => {
+                                // External type - create an opaque ADT
+                                // Use high bit as marker for external types
+                                return Ok(self.ctx.registry.intern(Ty::Adt {
+                                    def_id: 0x8000_0000,
+                                    name: stub.item_name.clone(),
+                                    args: vec![],
+                                }));
+                            }
+                        }
+                    }
+                    ResolvedItem::Rlib(_rlib_item) => {
+                        // Found in rlib but not fully parsed - treat as opaque
+                        return Ok(self.ctx.registry.fresh_infer());
+                    }
+                    ResolvedItem::NotFound => {
+                        // Not found in external crate - fall through to other checks
+                    }
+                }
+            }
 
             // Check for enum variant
             if let Some(enum_def) = self.ctx.registry.get_enum(type_name) {

@@ -55,6 +55,19 @@ impl<'a> Lowerer<'a> {
         derives
     }
 
+    /// Check if an item has #[cfg(test)] attribute (should be skipped during normal compilation)
+    fn has_cfg_test(&self, attrs: &[syn::Attribute]) -> bool {
+        for attr in attrs {
+            if attr.path().is_ident("cfg") {
+                let tokens = attr.meta.to_token_stream().to_string();
+                if tokens.contains("test") {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn span(&self, _s: proc_macro2::Span) -> Span {
         // Use dummy span - proc_macro2 span position requires special features
         Span::new(self.file_id, 0, 0)
@@ -187,6 +200,11 @@ impl<'a> Lowerer<'a> {
 
             // Recursively lower inline modules
             if let syn::Item::Mod(m) = item {
+                // Skip #[cfg(test)] modules during normal compilation
+                if self.has_cfg_test(&m.attrs) {
+                    continue;
+                }
+
                 if let Some((_, content_items)) = &m.content {
                     // Inline module: mod foo { ... }
                     let mod_prefix = if prefix.is_empty() {

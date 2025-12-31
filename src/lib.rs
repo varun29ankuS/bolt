@@ -15,10 +15,12 @@ pub mod typeck;
 pub mod borrowck;
 pub mod codegen;
 pub mod cache;
+pub mod cargo;
 pub mod cli;
 pub mod error;
 pub mod hir;
 pub mod runtime;
+pub mod extern_crates;
 
 pub use error::{BoltError, Result};
 pub use ty::TypeRegistry;

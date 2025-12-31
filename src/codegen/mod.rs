@@ -167,6 +167,15 @@ impl CodeGenerator {
         builder.symbol("bolt_box_new", crate::runtime::bolt_box_new as *const u8);
         builder.symbol("bolt_box_drop", crate::runtime::bolt_box_drop as *const u8);
 
+        // Register slice runtime functions
+        builder.symbol("bolt_slice_len", crate::runtime::bolt_slice_len as *const u8);
+        builder.symbol("bolt_slice_get", crate::runtime::bolt_slice_get as *const u8);
+        builder.symbol("bolt_slice_get_unchecked", crate::runtime::bolt_slice_get_unchecked as *const u8);
+        builder.symbol("bolt_slice_bounds_check", crate::runtime::bolt_slice_bounds_check as *const u8);
+        builder.symbol("bolt_slice_is_empty", crate::runtime::bolt_slice_is_empty as *const u8);
+        builder.symbol("bolt_slice_first", crate::runtime::bolt_slice_first as *const u8);
+        builder.symbol("bolt_slice_last", crate::runtime::bolt_slice_last as *const u8);
+
         // Register I/O functions
         builder.symbol("bolt_print_i64", crate::runtime::bolt_print_i64 as *const u8);
         builder.symbol("bolt_print_u64", crate::runtime::bolt_print_u64 as *const u8);
@@ -204,8 +213,9 @@ impl CodeGenerator {
         // Copy imports from crate
         self.imports = krate.imports.clone();
 
-        // Declare runtime functions
-        self.declare_runtime_functions()?;
+        // Note: We don't pre-declare runtime functions for self-hosting.
+        // All functions are compiled from source.
+        // self.declare_runtime_functions()?;
 
         // Collect struct layouts
         for (_, item) in &krate.items {
@@ -291,7 +301,7 @@ impl CodeGenerator {
         // Basic allocation
         declare_fn!("bolt_malloc", [types::I64], [types::I64]);
         declare_fn!("bolt_free", [types::I64, types::I64], []);
-        declare_fn!("bolt_realloc", [types::I64, types::I64, types::I64], [types::I64]);
+        declare_fn!("bolt_realloc", [types::I64, types::I64, types::I64, types::I64], [types::I64]);
 
         // Legacy print functions
         declare_fn!("bolt_print_int", [types::I64], []);
@@ -718,6 +728,12 @@ impl CodeGenerator {
     fn declare_function(&mut self, def_id: DefId, name: &str, func: &Function) -> Result<()> {
         let mut sig = self.module.make_signature();
 
+        // Check if function is already declared
+        if let Some(&existing_func_id) = self.func_names.get(name) {
+            self.func_ids.insert(def_id, existing_func_id);
+            return Ok(());
+        }
+
         // Extract module prefix from function name (e.g., "mymod::Point_new" -> "mymod")
         let module_prefix = Self::extract_module_prefix(name);
 
@@ -746,8 +762,11 @@ impl CodeGenerator {
             self.slice_param_funcs.insert(name.to_string(), slice_params);
         }
 
-        // Still return the pointer (for convenience in chaining)
-        sig.returns.push(AbiParam::new(types::I64));
+        // Only add return type if function doesn't return unit
+        if !matches!(func.sig.output.kind, TypeKind::Unit) {
+            let ret_ty = self.type_to_cl(&func.sig.output);
+            sig.returns.push(AbiParam::new(ret_ty));
+        }
 
         let func_id = self
             .module
@@ -763,6 +782,8 @@ impl CodeGenerator {
         let func_id = self.func_ids[&def_id];
         let module_prefix = Self::extract_module_prefix(name);
         let returns_struct = self.is_struct_type_with_prefix(&func.sig.output, &module_prefix);
+        let returns_unit = matches!(func.sig.output.kind, TypeKind::Unit);
+        let return_type = self.type_to_cl(&func.sig.output);
 
         self.ctx.func.signature = self.module.declarations().get_function_decl(func_id).signature.clone();
 
@@ -809,7 +830,7 @@ impl CodeGenerator {
             String::new()
         };
 
-        let mut translator = FunctionTranslator::new(builder, &self.type_registry, &self.func_ids, &self.func_names, &mut self.module, &self.struct_layouts, &self.enum_layouts, &self.type_impls, &self.imports, &self.slice_param_funcs, &self.const_values, &self.static_data, current_module);
+        let mut translator = FunctionTranslator::new(builder, &self.type_registry, &self.func_ids, &self.func_names, &mut self.module, &self.struct_layouts, &self.enum_layouts, &self.type_impls, &self.imports, &self.slice_param_funcs, &self.const_values, &self.static_data, current_module, returns_unit);
         translator.sret_ptr = sret_ptr;
 
         for (i, ((param_name, _ty), type_name)) in func.sig.inputs.iter().zip(param_type_names.into_iter()).enumerate() {
@@ -874,23 +895,43 @@ impl CodeGenerator {
 
         if let Some(ref body) = func.body {
             let result = translator.translate_block(body);
-            if let Some(val) = result {
+            if returns_unit {
+                // Unit-returning function: no return value
+                translator.builder.ins().return_(&[]);
+            } else if let Some(val) = result {
                 // If this function returns a struct, return the sret pointer
                 if let Some(sret) = original_sret {
                     // The struct data is already in sret (filled by struct expression)
                     translator.builder.ins().return_(&[sret]);
                 } else {
-                    // Coerce return value to i64 (function signature always uses i64)
-                    let val = translator.coerce_to_type(val, types::I64);
+                    // Coerce return value to match function signature
+                    let val = translator.coerce_to_type(val, return_type);
                     translator.builder.ins().return_(&[val]);
                 }
             } else {
-                let zero = translator.builder.ins().iconst(types::I64, 0);
+                // Generate zero of the correct return type
+                let zero = if return_type == types::F64 {
+                    translator.builder.ins().f64const(0.0)
+                } else if return_type == types::F32 {
+                    translator.builder.ins().f32const(0.0)
+                } else {
+                    translator.builder.ins().iconst(return_type, 0)
+                };
                 translator.builder.ins().return_(&[zero]);
             }
         } else {
-            let zero = translator.builder.ins().iconst(types::I64, 0);
-            translator.builder.ins().return_(&[zero]);
+            if returns_unit {
+                translator.builder.ins().return_(&[]);
+            } else {
+                let zero = if return_type == types::F64 {
+                    translator.builder.ins().f64const(0.0)
+                } else if return_type == types::F32 {
+                    translator.builder.ins().f32const(0.0)
+                } else {
+                    translator.builder.ins().iconst(return_type, 0)
+                };
+                translator.builder.ins().return_(&[zero]);
+            }
         }
 
         translator.finalize();
@@ -1082,6 +1123,7 @@ struct FunctionTranslator<'a, 'b> {
     loop_stack: Vec<(Block, Block)>,
     sret_ptr: Option<Value>,  // pointer to caller-allocated return space for struct returns
     current_module: String,  // e.g., "outer" for function "outer::get_inner"
+    returns_unit: bool,  // true if function returns ()
 }
 
 impl<'a, 'b> FunctionTranslator<'a, 'b> {
@@ -1099,6 +1141,7 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
         const_values: &'a HashMap<String, (i64, hir::Type)>,
         static_data: &'a HashMap<String, (DataId, bool, hir::Type)>,
         current_module: String,
+        returns_unit: bool,
     ) -> Self {
         Self {
             builder,
@@ -1121,6 +1164,7 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
             next_var: 0,
             loop_stack: Vec::new(),
             sret_ptr: None,
+            returns_unit,
         }
     }
 
@@ -1213,7 +1257,7 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
     fn infer_expr_type(&self, expr: &Expr) -> types::Type {
         match &expr.kind {
             ExprKind::Lit(lit) => match lit {
-                Literal::Bool(_) => types::I8,
+                Literal::Bool(_) => types::I64,
                 Literal::Char(_) => types::I32,
                 Literal::Int(_, Some(IntType::I8)) => types::I8,
                 Literal::Int(_, Some(IntType::I16)) => types::I16,
@@ -1888,13 +1932,22 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                 })
             }
             ExprKind::Return(inner) => {
-                let val = inner
-                    .as_ref()
-                    .map(|e| self.translate_expr(e))
-                    .unwrap_or_else(|| self.builder.ins().iconst(types::I64, 0));
-                // Coerce return value to i64 (function signature always uses i64)
-                let val = self.coerce_to_type(val, types::I64);
-                self.builder.ins().return_(&[val]);
+                if self.returns_unit {
+                    // Unit-returning function: no return value
+                    self.builder.ins().return_(&[]);
+                } else {
+                    let val = inner
+                        .as_ref()
+                        .map(|e| self.translate_expr(e))
+                        .unwrap_or_else(|| self.builder.ins().iconst(types::I64, 0));
+                    // Coerce return value to i64 (function signature always uses i64)
+                    let val = self.coerce_to_type(val, types::I64);
+                    self.builder.ins().return_(&[val]);
+                }
+                // Create unreachable block for code after return
+                let unreachable = self.builder.create_block();
+                self.builder.switch_to_block(unreachable);
+                self.builder.seal_block(unreachable);
                 self.builder.ins().iconst(types::I64, 0)
             }
             ExprKind::Call { func, args } => {
@@ -2410,32 +2463,34 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
                             // Get function reference
                             let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
 
-                            // Check if function name follows Type_method pattern and returns struct
-                            let returns_struct = if let Some(underscore_pos) = resolved_name.rfind('_') {
-                                let type_name = &resolved_name[..underscore_pos];
-                                self.struct_layouts.contains_key(type_name)
-                            } else {
-                                false
-                            };
+                            // Get function signature to detect sret
+                            let sig = self.module.declarations().get_function_decl(func_id).signature.clone();
+
+                            // Detect sret: if signature has more params than args, first param is sret pointer
+                            let returns_struct = sig.params.len() > args.len();
 
                             let mut arg_vals = Vec::new();
 
                             if returns_struct {
-                                // Extract type name and allocate sret space
-                                let underscore_pos = resolved_name.rfind('_').unwrap();
-                                let type_name = &resolved_name[..underscore_pos];
-                                let layout = self.struct_layouts.get(type_name).unwrap();
+                                // Allocate stack space for struct return (24 bytes is safe for most structs)
+                                // Try to find struct size from type name pattern
+                                let struct_size = if let Some(underscore_pos) = resolved_name.rfind('_') {
+                                    let type_name = &resolved_name[..underscore_pos];
+                                    self.struct_layouts.get(type_name)
+                                        .map(|l| l.size as u32)
+                                        .unwrap_or(24)
+                                } else {
+                                    24 // Default size for structs like BoltVec
+                                };
                                 let slot = self.builder.create_sized_stack_slot(cranelift::prelude::StackSlotData::new(
                                     cranelift::prelude::StackSlotKind::ExplicitSlot,
-                                    layout.size as u32,
+                                    struct_size,
                                     0,
                                 ));
                                 let sret = self.builder.ins().stack_addr(types::I64, slot, 0);
                                 arg_vals.push(sret);
                             }
 
-                            // Get function signature for type coercion
-                            let sig = self.module.declarations().get_function_decl(func_id).signature.clone();
                             let param_offset = if returns_struct { 1 } else { 0 };
 
                             // Check if this function has slice parameters
@@ -4127,7 +4182,7 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
 
     fn translate_literal(&mut self, lit: &Literal) -> Value {
         match lit {
-            Literal::Bool(b) => self.builder.ins().iconst(types::I8, if *b { 1 } else { 0 }),
+            Literal::Bool(b) => self.builder.ins().iconst(types::I64, if *b { 1 } else { 0 }),
             Literal::Char(c) => self.builder.ins().iconst(types::I32, *c as i64),
             Literal::Int(n, _) => self.builder.ins().iconst(types::I64, *n as i64),
             Literal::Uint(n, _) => self.builder.ins().iconst(types::I64, *n as i64),
@@ -4179,7 +4234,7 @@ impl<'a, 'b> FunctionTranslator<'a, 'b> {
     fn expr_type(&self, expr: &Expr) -> types::Type {
         match &expr.kind {
             ExprKind::Lit(lit) => match lit {
-                Literal::Bool(_) => types::I8,
+                Literal::Bool(_) => types::I64,
                 Literal::Char(_) => types::I32,
                 Literal::Int(_, _) | Literal::Uint(_, _) => types::I64,
                 Literal::Float(_, Some(FloatType::F32)) => types::F32,
@@ -4733,11 +4788,12 @@ extern "C" fn bolt_free(ptr: i64, size: i64) {
     }
 }
 
-extern "C" fn bolt_realloc(ptr: i64, old_size: i64, new_size: i64) -> i64 {
+extern "C" fn bolt_realloc(ptr: i64, old_size: i64, new_size: i64, align: i64) -> i64 {
     if ptr == 0 {
         return bolt_malloc(new_size);
     }
-    let old_layout = std::alloc::Layout::from_size_align(old_size as usize, 8).unwrap();
+    let alignment = if align > 0 { align as usize } else { 8 };
+    let old_layout = std::alloc::Layout::from_size_align(old_size as usize, alignment).unwrap();
     unsafe { std::alloc::realloc(ptr as *mut u8, old_layout, new_size as usize) as i64 }
 }
 

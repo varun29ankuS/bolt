@@ -3,6 +3,14 @@
 //! Simplified borrow checking focusing on common patterns.
 //! Full NLL (Non-Lexical Lifetimes) is out of scope for MVP.
 //!
+//! ## Ownership Ledger (Blockchain-inspired)
+//!
+//! The ledger module provides an append-only log of all ownership events:
+//! - Every create, move, borrow, drop is recorded
+//! - Full audit trail for debugging
+//! - LLM-friendly JSON output
+//! - Visual history for error messages
+//!
 //! ## Async Mode (BOL-14)
 //!
 //! The async_checker module provides background borrow checking:
@@ -12,6 +20,7 @@
 //! - Next compilation blocks if previous check failed
 
 pub mod async_checker;
+pub mod ledger;
 
 pub use async_checker::{global_checker, AsyncBorrowChecker, CheckResult};
 
@@ -472,6 +481,18 @@ impl BorrowChecker {
             ExprKind::Closure { body, .. } => {
                 self.check_expr(body, ctx, UseKind::Read);
             }
+            ExprKind::Struct { fields, rest, .. } => {
+                // Struct initialization: check each field expression
+                // fields is Vec<(String, Expr)>
+                for (_field_name, field_expr) in fields {
+                    // Field values are moved into the struct (or copied if Copy)
+                    self.check_expr(field_expr, ctx, UseKind::Move);
+                }
+                // Rest expression (..rest) is also read
+                if let Some(rest_expr) = rest {
+                    self.check_expr(rest_expr, ctx, UseKind::Read);
+                }
+            }
             _ => {}
         }
     }
@@ -558,6 +579,8 @@ fn is_copy_type(type_name: &str) -> bool {
         "Span" | "DefId" | "HirId" | "TypeId" | "TyId" | "LifetimeId" |
         "IntType" | "UintType" | "FloatType" | "BinaryOp" | "UnaryOp" |
         "BorrowKind" | "PlaceState" | "UseKind" |
+        // Ledger types (derive Copy)
+        "EventType" | "ValueState" | "Location" |
         // Common Rust std types that are Copy
         "Ordering" | "Option"  // Option<Copy> is Copy but we can't check generics here
     ) ||
@@ -601,13 +624,18 @@ fn is_likely_copy_var_name(var_name: &str) -> bool {
     var_name.ends_with("_index") || var_name.ends_with("_count") ||
     var_name.ends_with("_counter") || var_name == "counter" ||
     var_name.ends_with("_var") ||  // Stack variable slots are Copy
+    // Sequence numbers (like block height in ledger)
+    var_name == "seq" || var_name.ends_with("_seq") ||
+    var_name == "next_seq" || var_name == "prev_seq" ||
     // Common single-letter vars for numbers
     var_name == "i" || var_name == "j" || var_name == "n" || var_name == "len" ||
+    var_name == "count" ||  // Generic count variable
     // Common Copy values
     var_name == "zero" || var_name == "one" ||
     var_name == "start" || var_name == "end" ||  // Range bounds
     var_name.ends_with("_size") || var_name.ends_with("_len") ||
-    var_name.ends_with("_offset") || var_name.ends_with("_addr") ||
+    var_name == "offset" || var_name.ends_with("_offset") || var_name.ends_with("_addr") ||
+    var_name.ends_with("_after") || var_name.ends_with("_before") ||
     // Type information is usually Copy (types::Type, TyId, etc.)
     var_name.ends_with("_type") ||
     // Resolved values
@@ -623,7 +651,7 @@ fn is_likely_copy_var_name(var_name: &str) -> bool {
     // Key/value from iterating maps (often Copy types like DefId)
     var_name == "key" || var_name == "k" ||
     // Mutable flag variables
-    var_name.contains("mutable") || var_name.contains("mut") ||
+    var_name.contains("mutable") ||
     // Boolean flags
     var_name.starts_with("is_") || var_name.starts_with("has_") ||
     var_name.starts_with("can_") || var_name.starts_with("should_") ||
@@ -646,7 +674,24 @@ fn is_likely_copy_var_name(var_name: &str) -> bool {
     // Pattern variables (often Copy or cloned)
     var_name.ends_with("_pattern") || var_name == "pattern" ||
     // Template variables (often cloned for macro expansion)
-    var_name.ends_with("_template") || var_name == "template"
+    var_name.ends_with("_template") || var_name == "template" ||
+    // Line/column numbers (always Copy integers)
+    var_name == "line" || var_name == "column" || var_name == "row" ||
+    var_name.ends_with("_line") || var_name.ends_with("_column") ||
+    // State/phase enums (often Copy)
+    var_name == "state" || var_name.ends_with("_state") ||
+    var_name == "phase" || var_name.ends_with("_phase") ||
+    var_name == "status" || var_name.ends_with("_status") ||
+    // Event types (usually Copy enums)
+    var_name.ends_with("_event") || var_name == "event_type" ||
+    // Package/metadata references (often borrowed)
+    var_name == "root_package" || var_name.ends_with("_package") ||
+    var_name == "package" || var_name == "metadata" ||
+    // Expression and pattern variables (commonly borrowed in compilers)
+    var_name == "expr" || var_name == "pat" || var_name == "stmt" ||
+    var_name.ends_with("_expr") || var_name.ends_with("_pat") ||
+    // Short string variables (often &str which is Copy)
+    var_name == "s" || var_name == "ch" || var_name == "c"
 }
 
 impl BorrowContext {

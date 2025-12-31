@@ -201,6 +201,11 @@ pub enum ErrorCode {
     UnsupportedFeature,
     InternalError,
 
+    // IO errors (E0600-E0699)
+    IoError,
+    FileNotFound,
+    ProjectNotFound,
+
     // Generic fallback
     Unknown,
 }
@@ -233,6 +238,9 @@ impl ErrorCode {
             Self::UnreachablePattern => "E0001",
             Self::UnsupportedFeature => "E0500",
             Self::InternalError => "E0501",
+            Self::IoError => "E0600",
+            Self::FileNotFound => "E0601",
+            Self::ProjectNotFound => "E0602",
             Self::Unknown => "E9999",
         }
     }
