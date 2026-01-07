@@ -127,10 +127,16 @@ impl TypeContext {
             (Some(Ty::Unit), Some(Ty::Unit)) => true,
             (Some(Ty::Bool), Some(Ty::Bool)) => true,
             (Some(Ty::Char), Some(Ty::Char)) => true,
-            // Numeric coercion: allow different int/uint sizes for self-hosting flexibility
+            // Numeric coercion: allow different int/uint/float sizes for self-hosting flexibility
+            // Rust will catch precision issues; we prioritize fast feedback
             (Some(Ty::Int(_)), Some(Ty::Int(_))) => true,
             (Some(Ty::Uint(_)), Some(Ty::Uint(_))) => true,
-            (Some(Ty::Float(f1)), Some(Ty::Float(f2))) => f1 == f2,
+            (Some(Ty::Float(_)), Some(Ty::Float(_))) => true,
+            // Allow int/float coercion for arithmetic (e.g., 2.0 * count as f64)
+            (Some(Ty::Int(_)), Some(Ty::Float(_))) => true,
+            (Some(Ty::Float(_)), Some(Ty::Int(_))) => true,
+            (Some(Ty::Uint(_)), Some(Ty::Float(_))) => true,
+            (Some(Ty::Float(_)), Some(Ty::Uint(_))) => true,
             (Some(Ty::Str), Some(Ty::Str)) => true,
             // References
             (

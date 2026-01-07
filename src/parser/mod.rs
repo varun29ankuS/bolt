@@ -174,6 +174,56 @@ impl Parser {
         Ok(())
     }
 
+    /// Parse source code from a string (for API/programmatic use)
+    ///
+    /// # Arguments
+    /// * `source` - Rust source code as a string
+    /// * `filename` - Virtual filename for error messages
+    ///
+    /// # Returns
+    /// A parsed `Crate` on success
+    pub fn parse_source(&self, source: &str, filename: &str) -> Result<Crate> {
+        let path = PathBuf::from(filename);
+        let crate_name = Path::new(filename)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("input")
+            .to_string();
+
+        // Add to global source map
+        let global_file_id = crate::error::source_map()
+            .add_source(path.clone(), source.to_string());
+
+        // Also add to local source map
+        let _file_id = self.source_map.add_file(path.clone(), source.to_string());
+
+        let syn_file = syn::parse_file(source).map_err(|e| BoltError::Parse {
+            file: path.clone(),
+            line: e.span().start().line,
+            col: e.span().start().column,
+            message: e.to_string(),
+        })?;
+
+        let mut krate = Crate::new(crate_name);
+        let lowerer = lower::Lowerer::new(self, global_file_id, path);
+        lowerer.lower_file(&syn_file, &mut krate);
+
+        if self.diagnostics.read().has_errors() {
+            let diags = self.diagnostics.write().take_diagnostics();
+            let first_error = diags.into_iter().find(|d| d.level == crate::error::DiagnosticLevel::Error);
+            if let Some(diag) = first_error {
+                return Err(BoltError::Parse {
+                    file: PathBuf::from(filename),
+                    line: 0,
+                    col: 0,
+                    message: diag.message,
+                });
+            }
+        }
+
+        Ok(krate)
+    }
+
     pub fn parse_files_parallel(&self, paths: &[PathBuf]) -> Result<Vec<Crate>> {
         paths
             .par_iter()

@@ -606,9 +606,21 @@ impl NllChecker {
 
     fn default_copy_types() -> HashSet<String> {
         let mut copy = HashSet::new();
+        // Primitives
         for t in &["i8", "i16", "i32", "i64", "i128", "isize",
                    "u8", "u16", "u32", "u64", "u128", "usize",
                    "f32", "f64", "bool", "char", "()", "!"] {
+            copy.insert(t.to_string());
+        }
+        // Bolt's own Copy types
+        for t in &["Span", "DefId", "HirId", "TypeId", "TyId", "LifetimeId",
+                   "IntType", "UintType", "FloatType", "BinaryOp", "UnaryOp",
+                   "BorrowKind", "PlaceState", "UseKind", "Location",
+                   "EventType", "ValueState", "Ordering",
+                   // Cranelift types
+                   "Value", "Block", "Type", "FuncId", "StackSlot",
+                   // Common Copy enums/structs
+                   "Option", "Severity", "ErrorCode"] {
             copy.insert(t.to_string());
         }
         copy
@@ -665,7 +677,9 @@ impl NllChecker {
                         // Mark as moved (if not Copy)
                         // Look up variable's type, then check if that type is Copy
                         let var_type = var_types.get(&src.base);
-                        let is_copy = var_type.map(|t| self.is_copy(t)).unwrap_or(false);
+                        let is_copy = var_type.map(|t| self.is_copy(t)).unwrap_or(false)
+                            // Fallback: use naming convention heuristics when no type info
+                            || self.is_likely_copy_var(&src.base);
                         if !is_copy {
                             moved.insert(src.clone());
                         }
@@ -718,7 +732,39 @@ impl NllChecker {
     }
 
     fn is_copy(&self, type_name: &str) -> bool {
-        self.copy_types.contains(type_name)
+        // Direct match
+        if self.copy_types.contains(type_name) {
+            return true;
+        }
+        // References and raw pointers are always Copy
+        if type_name.starts_with('&') || type_name.starts_with('*') {
+            return true;
+        }
+        // Types ending in Id are usually Copy (DefId, TyId, FuncId, etc.)
+        if type_name.ends_with("Id") {
+            return true;
+        }
+        false
+    }
+
+    /// Check if a variable name likely refers to a Copy type based on naming conventions
+    fn is_likely_copy_var(&self, var_name: &str) -> bool {
+        // Common Copy variable patterns
+        var_name.ends_with("_block") ||  // Cranelift Block
+        var_name == "lhs" || var_name == "rhs" ||  // Cranelift Value
+        var_name == "val" || var_name == "ptr" ||
+        var_name.ends_with("_val") || var_name.ends_with("_ptr") ||
+        var_name == "id" || var_name.ends_with("_id") ||
+        var_name == "ty" || var_name.ends_with("_ty") ||
+        var_name == "span" || var_name.ends_with("_span") ||
+        var_name == "idx" || var_name == "index" || var_name.ends_with("_idx") ||
+        var_name == "i" || var_name == "j" || var_name == "n" || var_name == "len" ||
+        var_name == "count" || var_name.ends_with("_count") ||
+        var_name == "offset" || var_name.ends_with("_offset") ||
+        var_name.starts_with("is_") || var_name.starts_with("has_") ||  // Boolean flags
+        var_name == "start" || var_name == "end" ||
+        var_name == "line" || var_name == "column" ||
+        var_name == "key" || var_name == "k"  // Often Copy types in iteration
     }
 
     pub fn check_crate(&self, krate: &Crate) {

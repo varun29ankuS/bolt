@@ -502,8 +502,50 @@ impl StubRegistry {
             generics: vec![],
         });
 
-        // parking_lot types are mostly used as concrete types, not traits
-        // But we stub RwLock, Mutex behavior through their methods
+        // parking_lot types
+        self.register_type(TypeStub {
+            name: "RwLock".into(),
+            crate_name: "parking_lot".into(),
+            kind: TypeStubKind::Opaque,
+            generics: vec!["T".into()],
+        });
+
+        self.register_type(TypeStub {
+            name: "Mutex".into(),
+            crate_name: "parking_lot".into(),
+            kind: TypeStubKind::Opaque,
+            generics: vec!["T".into()],
+        });
+
+        // dashmap - concurrent hashmap
+        self.register_type(TypeStub {
+            name: "DashMap".into(),
+            crate_name: "dashmap".into(),
+            kind: TypeStubKind::Opaque,
+            generics: vec!["K".into(), "V".into()],
+        });
+
+        self.register_type(TypeStub {
+            name: "DashSet".into(),
+            crate_name: "dashmap".into(),
+            kind: TypeStubKind::Opaque,
+            generics: vec!["T".into()],
+        });
+
+        // once_cell
+        self.register_type(TypeStub {
+            name: "Lazy".into(),
+            crate_name: "once_cell".into(),
+            kind: TypeStubKind::Opaque,
+            generics: vec!["T".into()],
+        });
+
+        self.register_type(TypeStub {
+            name: "OnceCell".into(),
+            crate_name: "once_cell".into(),
+            kind: TypeStubKind::Opaque,
+            generics: vec!["T".into()],
+        });
 
         // indexmap - mostly concrete types
         self.register_type(TypeStub {

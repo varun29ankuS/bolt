@@ -238,12 +238,18 @@ impl BorrowChecker {
     }
 
     fn check_stmt(&self, stmt: &Stmt, ctx: &mut BorrowContext) {
+        // Track borrows before statement for cleanup
+        let borrows_before = ctx.active_borrows.len();
+
         match &stmt.kind {
             StmtKind::Let { pattern, ty, init } => {
                 if let Some(init) = init {
                     // Use Move for bindings - Copy types will be handled correctly
                     // by the Move handler (they just get copied without state change)
                     self.check_expr(init, ctx, UseKind::Move);
+                    // Release temporary borrows from the init expression
+                    // (they don't persist into later statements)
+                    ctx.active_borrows.truncate(borrows_before);
                 }
                 // Extract type name for Copy checking - try annotation first, then infer from init
                 let type_name = ty.as_ref()
@@ -253,6 +259,10 @@ impl BorrowChecker {
             }
             StmtKind::Expr(expr) | StmtKind::Semi(expr) => {
                 self.check_expr(expr, ctx, UseKind::Read);
+                // Release temporary borrows after expression statements
+                // This simulates NLL-like behavior: borrows from method calls
+                // don't persist beyond the statement they're used in
+                ctx.active_borrows.truncate(borrows_before);
             }
             StmtKind::Item(_) => {}
         }
@@ -554,20 +564,47 @@ impl BorrowChecker {
                 }
             }
             ExprKind::MethodCall { receiver, method, args } => {
-                // Special handling for clone-like methods that borrow instead of consuming
-                // These methods take &self and return an owned copy
-                let is_clone_method = matches!(
-                    method.as_str(),
-                    "clone" | "to_owned" | "to_string" | "to_vec"
+                // Categorize methods by whether they consume self or just borrow
+                let method_name = method.as_str();
+
+                // Methods that definitely borrow &self (don't consume)
+                let is_borrow_method = matches!(method_name,
+                    // Clone/copy methods
+                    "clone" | "to_owned" | "to_string" | "to_vec" | "copied" | "cloned" |
+                    // Accessor methods
+                    "get" | "get_mut" | "first" | "last" | "front" | "back" |
+                    "iter" | "iter_mut" | "keys" | "values" | "entries" |
+                    "len" | "is_empty" | "contains" | "contains_key" |
+                    // Display/debug
+                    "fmt" | "display" | "as_str" | "as_bytes" | "as_slice" | "as_ref" | "as_mut" |
+                    // Query methods
+                    "find" | "filter" | "map" | "any" | "all" | "count" |
+                    // Common collection methods
+                    "push" | "pop" | "insert" | "remove" | "clear" | "extend" |
+                    "write" | "read" | "flush" | "emit" |
+                    // Comparison
+                    "eq" | "cmp" | "partial_cmp" | "hash" |
+                    // Conversion that borrows
+                    "borrow" | "deref" | "index"
                 );
 
-                if is_clone_method {
-                    // Clone just borrows the receiver, doesn't move it
-                    self.check_expr(receiver, ctx, UseKind::Borrow);
+                // Methods that consume self
+                let is_consume_method = matches!(method_name,
+                    "into_iter" | "into_inner" | "into_vec" | "into_string" |
+                    "unwrap" | "unwrap_or" | "unwrap_or_else" | "expect" |
+                    "ok" | "err" | "map_err" | "and_then" | "or_else"
+                );
+
+                let receiver_use = if is_borrow_method {
+                    UseKind::Borrow
+                } else if is_consume_method {
+                    UseKind::Move
                 } else {
-                    // Other methods: check receiver as read (may or may not consume)
-                    self.check_expr(receiver, ctx, UseKind::Read);
-                }
+                    // Default: assume borrow for most methods (be lenient)
+                    UseKind::Borrow
+                };
+
+                self.check_expr(receiver, ctx, receiver_use);
 
                 for arg in args {
                     self.check_expr(arg, ctx, UseKind::Move);
@@ -642,7 +679,18 @@ impl BorrowChecker {
                 self.check_block(body, ctx);
             }
             ExprKind::For { pattern, iter, body, .. } => {
-                self.check_expr(iter, ctx, UseKind::Move);
+                // Determine if iterator is a borrow or owned
+                // `for x in &collection` or `for x in collection.iter()` = borrow
+                // `for x in collection.into_iter()` or `for x in collection` = move
+                let iter_use = match &iter.kind {
+                    ExprKind::Ref { .. } => UseKind::Borrow,
+                    ExprKind::MethodCall { method, .. } if method == "iter" || method == "iter_mut" => UseKind::Borrow,
+                    ExprKind::MethodCall { method, .. } if method == "into_iter" || method == "drain" => UseKind::Move,
+                    // Default: for `for x in collection`, Rust calls IntoIterator
+                    // which may borrow or move depending on type. Be lenient: assume borrow.
+                    _ => UseKind::Borrow,
+                };
+                self.check_expr(iter, ctx, iter_use);
                 self.bind_pattern(pattern, ctx, None);  // For loop vars type unknown at this level
                 self.check_block(body, ctx);
             }
