@@ -1,95 +1,128 @@
-# Bolt Overnight TODO
+# Bolt 0.1.2 Release TODO
 
-Last updated: 2026-01-07
-Current error count: 26
+**Target:** Morning of 2026-01-08
+**Current errors:** 26
 
-## Priority 1: Proc Macro Support (HIGH IMPACT)
+---
 
-### Goal: Support `#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]`
+## PHASE 1: Derive Macros [CRITICAL]
 
-This is the #1 blocker for real-world usage. Most Rust code uses derive macros.
+### 1.1 Create derive expansion module
+- [ ] Create `src/derive.rs` with expansion framework
+- [ ] Hook into parser to detect `#[derive(...)]` attributes
+- [ ] Generate impl blocks and add to HIR
 
-- [ ] **1.1** Add derive expansion framework in `src/parser/mod.rs`
-  - Detect `#[derive(...)]` attributes on structs/enums
-  - Generate impl blocks for each derived trait
+### 1.2 Implement derive(Clone)
+- [ ] Generate `fn clone(&self) -> Self`
+- [ ] Handle struct fields (call `.clone()` on each)
+- [ ] Handle tuple structs
+- [ ] Handle unit structs
+- [ ] Test: `examples/derive_clone.rs`
 
-- [ ] **1.2** Implement `derive(Debug)`
-  - Generate `fn fmt(&self, f: &mut Formatter) -> Result<(), Error>`
-  - Handle struct fields, enum variants
+### 1.3 Implement derive(Debug)
+- [ ] Generate `fn fmt(&self, f: &mut Formatter) -> Result`
+- [ ] Handle struct fields with `{:?}` formatting
+- [ ] Handle enums with variant names
+- [ ] Test: create `examples/derive_debug.rs`
 
-- [ ] **1.3** Implement `derive(Clone)`
-  - Generate `fn clone(&self) -> Self`
-  - Call `.clone()` on each field
+### 1.4 Implement derive(Default)
+- [ ] Generate `fn default() -> Self`
+- [ ] Use `Default::default()` for each field
+- [ ] Test: create `examples/derive_default.rs`
 
-- [ ] **1.4** Implement `derive(Copy)` - marker trait, just register
+### 1.5 Implement derive(Copy)
+- [ ] Register as marker trait (no methods)
+- [ ] Mark struct as Copy in type registry
+- [ ] Test: create `examples/derive_copy.rs`
 
-- [ ] **1.5** Implement `derive(Default)`
-  - Generate `fn default() -> Self`
-  - Use `Default::default()` for each field
+### 1.6 Implement derive(PartialEq, Eq)
+- [ ] Generate `fn eq(&self, other: &Self) -> bool`
+- [ ] Compare each field with `==`
+- [ ] Test: create `examples/derive_eq.rs`
 
-- [ ] **1.6** Implement `derive(PartialEq, Eq)`
-  - Generate `fn eq(&self, other: &Self) -> bool`
-  - Compare each field
+### 1.7 Implement derive(Hash)
+- [ ] Generate `fn hash<H: Hasher>(&self, state: &mut H)`
+- [ ] Call `.hash(state)` on each field
+- [ ] Test: create `examples/derive_hash.rs`
 
-- [ ] **1.7** Implement `derive(Hash)`
-  - Generate `fn hash<H: Hasher>(&self, state: &mut H)`
+---
 
-## Priority 2: Reduce False Positives (QUALITY)
+## PHASE 2: False Positive Fixes [HIGH]
 
-### Goal: Get self-check to 0 errors
+### 2.1 Loop variable patterns
+- [ ] Fix "use of moved value" in for loops
+- [ ] Handle iterator rebinding
+- [ ] File: `src/borrowck/mod.rs`
 
-Current patterns causing issues:
-- [ ] **2.1** "cannot move out of X because it is borrowed" in loops
-- [ ] **2.2** "use of moved value" for iterator variables
-- [ ] **2.3** HashMap/Vec iteration patterns
-- [ ] **2.4** Pattern matching with moves
+### 2.2 HashMap iteration
+- [ ] Fix borrow conflicts during iteration
+- [ ] Handle `.iter()`, `.iter_mut()`, `.into_iter()`
+- [ ] File: `src/borrowck/nll.rs`
 
-Files: `src/borrowck/mod.rs`, `src/borrowck/nll.rs`
+### 2.3 Pattern matching moves
+- [ ] Fix moves in match arms
+- [ ] Handle `if let` patterns
+- [ ] File: `src/borrowck/mod.rs`
 
-## Priority 3: Performance (SPEED)
+**Target:** Reduce errors from 26 to <10
 
-### Goal: <100ms for any project
+---
 
-- [ ] **3.1** Profile self-check bottlenecks
-- [ ] **3.2** Add parallel type checking per function
-- [ ] **3.3** Implement expression-level caching
-- [ ] **3.4** Lazy parsing for unchanged files
+## PHASE 3: Testing [MEDIUM]
 
-## Priority 4: External Crates (USABILITY)
+### 3.1 Integration tests
+- [ ] Add `tests/` directory
+- [ ] Test all examples pass
+- [ ] Test error detection works
 
-### Goal: Auto-stub from rlib files
+### 3.2 Derive macro tests
+- [ ] Test each derive variant
+- [ ] Test combined derives `#[derive(Clone, Debug, Default)]`
 
-- [ ] **4.1** Parse `.rlib` metadata for type signatures
-- [ ] **4.2** Cache extracted stubs
-- [ ] **4.3** Add stubs for top 20 crates.io crates
+---
 
-## Priority 5: Code Quality
+## PHASE 4: Release [FINAL]
 
-- [ ] **5.1** Add integration tests for each example
-- [ ] **5.2** Document public API
-- [ ] **5.3** Add benchmarks
+### 4.1 Documentation
+- [ ] Update README.md with new features
+- [ ] Verify CHANGELOG.md is complete
+- [ ] Check all doc comments
+
+### 4.2 Publish
+- [ ] `cargo test`
+- [ ] `cargo publish --dry-run`
+- [ ] `cargo publish`
+- [ ] Tag release: `git tag v0.1.2 && git push --tags`
 
 ---
 
 ## Session Log
 
-### Session 1 (2026-01-07)
-- Fixed float type coercion (f32 <-> f64)
-- Improved NLL copy type detection
-- Added iterator/loop handling
-- Added method call categorization
-- Reduced errors: 55 -> 26
-- Added api.rs and fixes.rs modules
+### Session 1: 2026-01-07 (human + AI)
+- Fixed float coercion
+- Improved borrow checker
+- Added api.rs, fixes.rs
+- Errors: 55 → 26
+- Set up overnight automation
 
-### Session 2 (overnight)
-- [ ] Start here...
+### Session 2: 2026-01-07 overnight (autonomous)
+_Start here..._
 
 ---
 
-## How to Update This File
+## Quick Reference
 
-After completing a task:
-1. Mark it `[x]`
-2. Add notes under Session Log
-3. Update "Current error count" at top
-4. Commit: `git add TODO.md && git commit -m "docs: update progress" && git push`
+```bash
+# Build
+cargo build --release
+
+# Test
+./target/release/bolt.exe check .
+./target/release/bolt.exe check examples/derive_clone.rs
+
+# Error count
+./target/release/bolt.exe check . 2>&1 | grep -c "^Error:"
+
+# Commit
+git add -A && git commit -m "feat: [description]" && git push
+```

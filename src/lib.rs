@@ -64,6 +64,7 @@ pub mod cache;
 pub mod cargo;
 pub mod cli;
 pub mod codegen;
+pub mod derive;
 pub mod error;
 pub mod extern_crates;
 pub mod fixes;

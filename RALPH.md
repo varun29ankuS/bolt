@@ -1,108 +1,153 @@
-# Bolt Autonomous Development Session
+# Bolt 0.1.2 Overnight Development
 
-You are autonomously improving `bolt-rs`, a fast Rust type checker.
+You are autonomously working toward the **bolt-rs 0.1.2 release**.
 
-## First: Read Context
+## STEP 1: Load Context
 
-1. Read `CLAUDE.md` for project architecture
-2. Read `TODO.md` for current priorities and progress
-3. Check current state: `./target/release/bolt.exe check . 2>&1 | grep -c "^Error:"`
+Read these files in order:
+1. `CLAUDE.md` - Architecture overview
+2. `TODO.md` - Task list and progress
+3. `CHANGELOG.md` - What's planned for 0.1.2
 
-## Your Session Goal
-
-Pick the HIGHEST PRIORITY uncompleted task from `TODO.md` and work on it.
-
-**Priority order:**
-1. Proc macro support (derive) - HIGHEST IMPACT
-2. Reduce false positives
-3. Performance
-4. External crates
-
-## Work Process
-
-### 1. Understand the Task
-- Read relevant source files
-- Understand existing patterns
-- Plan your approach
-
-### 2. Implement Incrementally
-- Make small, testable changes
-- Build frequently: `cargo build --release 2>&1 | tail -10`
-- Test after each change
-
-### 3. Verify
+Check current state:
 ```bash
-# Must pass
-cargo build --release
+./target/release/bolt.exe check . 2>&1 | grep -c "^Error:"
+```
 
-# Check for regressions
+## STEP 2: Pick Next Task
+
+Work through `TODO.md` in order:
+1. **PHASE 1** - Derive macros (most important!)
+2. **PHASE 2** - False positive fixes
+3. **PHASE 3** - Testing
+4. **PHASE 4** - Release prep
+
+Pick the **first uncompleted task** and focus on it.
+
+## STEP 3: Implement Derive Macros
+
+This is the #1 priority. Here's how:
+
+### Location
+Create `src/derive.rs` for the expansion logic.
+
+### Integration Point
+In `src/parser/mod.rs`, after parsing a struct/enum with `#[derive(...)]`:
+1. Parse normally to get the Item
+2. Call derive expansion
+3. Add generated impls to krate.items
+
+### Template for derive.rs
+
+```rust
+//! Derive macro expansion for common traits
+
+use crate::hir::*;
+
+/// Expand derive attributes on an item
+pub fn expand_derives(item: &Item, attrs: &[Attribute]) -> Vec<Item> {
+    let mut impls = vec![];
+
+    for attr in attrs {
+        if attr.path == "derive" {
+            for trait_name in &attr.tokens {
+                if let Some(impl_item) = expand_single_derive(item, trait_name) {
+                    impls.push(impl_item);
+                }
+            }
+        }
+    }
+
+    impls
+}
+
+fn expand_single_derive(item: &Item, trait_name: &str) -> Option<Item> {
+    match trait_name {
+        "Clone" => Some(expand_clone(item)),
+        "Debug" => Some(expand_debug(item)),
+        "Default" => Some(expand_default(item)),
+        "Copy" => Some(expand_copy(item)),
+        "PartialEq" => Some(expand_partial_eq(item)),
+        "Eq" => Some(expand_eq(item)),
+        "Hash" => Some(expand_hash(item)),
+        _ => None, // Unknown derive, skip
+    }
+}
+
+fn expand_clone(item: &Item) -> Item {
+    // Generate: impl Clone for StructName {
+    //     fn clone(&self) -> Self {
+    //         Self { field1: self.field1.clone(), ... }
+    //     }
+    // }
+    todo!("implement clone expansion")
+}
+
+// ... implement other derives
+```
+
+### Testing Each Derive
+
+After implementing each derive:
+```bash
+# Create test
+echo '#[derive(Clone)]
+struct Foo { x: i32, y: String }
+fn main() {
+    let a = Foo { x: 1, y: String::from("hi") };
+    let b = a.clone();
+}' > /tmp/test_clone.rs
+
+# Test
+./target/release/bolt.exe check /tmp/test_clone.rs
+```
+
+## STEP 4: Build & Test
+
+After every change:
+```bash
+cargo build --release 2>&1 | tail -5
+
+# Must not increase errors
 ./target/release/bolt.exe check . 2>&1 | grep -c "^Error:"
 
-# Test examples still work
+# Examples must still work
 ./target/release/bolt.exe check examples/very_simple.rs
 ```
 
-### 4. Commit Progress
+## STEP 5: Commit Progress
+
+After completing each task:
 ```bash
 git add -A
-git commit -m "feat: [what you did]"
+git commit -m "feat(derive): implement Clone expansion"
 git push
 ```
 
-### 5. Update TODO.md
-- Mark completed items `[x]`
-- Add session notes
-- Update error count
+## STEP 6: Update TODO.md
 
-## Proc Macro Implementation Guide
-
-If working on `#[derive(...)]`:
-
-### Location
-`src/parser/mod.rs` or new file `src/derive.rs`
-
-### Approach
-```rust
-// In parser, when you see #[derive(Trait)] on a struct:
-// 1. Parse the struct normally
-// 2. For each derived trait, generate an impl block
-// 3. Add the impl to krate.items
-
-fn expand_derive(struct_item: &Item, traits: &[String]) -> Vec<Item> {
-    let mut impls = vec![];
-    for trait_name in traits {
-        match trait_name.as_str() {
-            "Clone" => impls.push(generate_clone_impl(struct_item)),
-            "Debug" => impls.push(generate_debug_impl(struct_item)),
-            // etc
-            _ => {} // Unknown derive, skip
-        }
-    }
-    impls
-}
-```
-
-### Testing Derive
-```bash
-# Create test file
-echo 'struct Foo { x: i32 }
-impl Clone for Foo { fn clone(&self) -> Self { Foo { x: self.x } } }
-fn main() { let a = Foo { x: 1 }; let b = a.clone(); }' > /tmp/test.rs
-
-./target/release/bolt.exe check /tmp/test.rs
-```
+Mark completed tasks with `[x]` and add session notes.
 
 ## Session Rules
 
-1. **One task at a time** - Complete or make significant progress before switching
-2. **Always commit working code** - Don't leave broken state
-3. **Update TODO.md** - Track what you did
-4. **Test before commit** - Verify no regressions
-5. **If stuck > 30min** - Move to next task, note blocker in TODO.md
+1. **Focus on derive macros first** - This is the release blocker
+2. **Small incremental commits** - Don't batch up huge changes
+3. **Test after each change** - No regressions allowed
+4. **Update TODO.md** - Track progress for next iteration
+5. **If stuck >20 min** - Note blocker, move to Phase 2 tasks
 
-## End of Session
+## End of Session Checklist
 
 Before stopping:
-1. Commit all working changes
-2. Update TODO.md with progress
-3. Note any blockers or ideas for next session
+- [ ] All changes committed and pushed
+- [ ] TODO.md updated with progress
+- [ ] CHANGELOG.md updated if needed
+- [ ] No build errors
+- [ ] Error count same or lower
+
+## Target for Morning
+
+- `#[derive(Clone, Debug, Default)]` working
+- Self-check errors < 15
+- All tests passing
+- Ready for `cargo publish`

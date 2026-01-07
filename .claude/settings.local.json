@@ -62,7 +62,12 @@
       "mcp__shodh-memory__delete_project",
       "Bash(timeout 120 ./target/release/bolt.exe run:*)",
       "Bash(do echo \"=== Checking $f ===\")",
-      "Bash(./target/release/bolt.exe:*)"
+      "Bash(./target/release/bolt.exe:*)",
+      "Bash(where:*)",
+      "Bash(cargo install:*)",
+      "Bash(cargo search:*)",
+      "WebFetch(domain:ghuntley.com)",
+      "mcp__shodh-memory__memory_stats"
     ]
   }
 }
