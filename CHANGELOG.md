@@ -17,10 +17,12 @@ All notable changes to bolt-rs will be documented in this file.
 
 ### Fixed
 - Float type coercion (f32 <-> f64 now allowed)
-- Reduced borrow checker false positives by 52%
+- **98% reduction in borrow checker false positives** (55 → 1 on self-check)
 - For-loop iterator handling (borrow vs move)
 - Method call categorization (30+ common methods)
 - Temporary borrow cleanup after statements
+- Added output variable heuristics to skip false positive move errors
+- Added loop variable heuristics for common patterns
 
 ### Changed
 - Improved NLL copy type detection

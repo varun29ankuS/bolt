@@ -67,7 +67,8 @@
       "Bash(cargo install:*)",
       "Bash(cargo search:*)",
       "WebFetch(domain:ghuntley.com)",
-      "mcp__shodh-memory__memory_stats"
+      "mcp__shodh-memory__memory_stats",
+      "Bash(timeout:*)"
     ]
   }
 }
