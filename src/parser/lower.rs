@@ -1,5 +1,6 @@
 //! Lowering from syn AST to HIR
 
+use crate::derive;
 use crate::error::Span;
 use crate::hir::*;
 use crate::parser::Parser;
@@ -149,6 +150,9 @@ impl<'a> Lowerer<'a> {
                 }
 
                 let id = hir_item.id;
+                let item_name = hir_item.name.clone();
+                let item_span = hir_item.span;
+
                 if let ItemKind::Function(ref f) = hir_item.kind {
                     // Only look for main at the top level with original name
                     if prefix.is_empty() && hir_item.name == "main" && f.sig.inputs.is_empty() {
@@ -159,7 +163,40 @@ impl<'a> Lowerer<'a> {
                 if let ItemKind::Macro(ref macro_def) = hir_item.kind {
                     krate.macros.insert(hir_item.name.clone(), macro_def.clone());
                 }
+
+                // Extract struct fields for derive expansion before moving hir_item
+                let struct_fields: Option<Vec<(String, Type)>> = match &hir_item.kind {
+                    ItemKind::Struct(s) => match &s.kind {
+                        StructKind::Named(fields) => Some(
+                            fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect()
+                        ),
+                        StructKind::Tuple(types) => Some(
+                            types.iter().enumerate().map(|(i, ty)| (i.to_string(), ty.clone())).collect()
+                        ),
+                        StructKind::Unit => Some(vec![]),
+                    },
+                    _ => None,
+                };
+
                 krate.items.insert(id, hir_item);
+
+                // Expand #[derive(...)] attributes for structs
+                if let syn::Item::Struct(s) = item {
+                    if let Some(fields) = struct_fields {
+                        let derives = self.extract_derive_attrs(&s.attrs);
+                        if !derives.is_empty() {
+                            let derived_impls = derive::expand_derive_for_struct(
+                                &item_name,
+                                &fields,
+                                &derives,
+                                item_span,
+                            );
+                            for (impl_id, impl_item) in derived_impls {
+                                krate.items.insert(impl_id, impl_item);
+                            }
+                        }
+                    }
+                }
             }
 
             // Also lower methods from impl blocks and update impl.items with correct DefIds
@@ -1921,6 +1958,30 @@ impl<'a> Lowerer<'a> {
             syn::BinOp::Ge(_) => BinaryOp::Ge,
             _ => BinaryOp::Add,
         }
+    }
+
+    /// Extract derive trait names from attributes
+    fn extract_derive_attrs(&self, attrs: &[syn::Attribute]) -> Vec<String> {
+        let mut derives = Vec::new();
+
+        for attr in attrs {
+            // Check for #[derive(...)]
+            if attr.path().is_ident("derive") {
+                // Parse the meta to extract trait names
+                if let Ok(meta) = attr.meta.require_list() {
+                    // Tokens look like: Clone, Debug, Default
+                    let tokens_str = meta.tokens.to_string();
+                    for part in tokens_str.split(',') {
+                        let trimmed = part.trim();
+                        if !trimmed.is_empty() {
+                            derives.push(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        derives
     }
 }
 

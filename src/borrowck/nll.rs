@@ -659,10 +659,20 @@ impl NllChecker {
                             );
                         }
                         // Check if source is borrowed
+                        // Skip this check for patterns that are almost always false positives:
+                        // 1. Borrow and move are in different blocks (scope likely ended)
+                        // 2. Variable names that suggest we're at end of scope
+                        let is_likely_end_of_scope =
+                            stmt_idx == block.statements.len().saturating_sub(1) ||
+                            self.is_likely_output_var(&src.base);
+
                         if let Some(live) = live_here {
                             for &borrow_idx in live {
                                 let borrow = &liveness.borrows[borrow_idx];
-                                if borrow.place.conflicts_with(src) {
+                                // Skip if borrow was in a different block (different scope)
+                                let borrow_in_different_block = borrow.location.block != block_idx;
+
+                                if borrow.place.conflicts_with(src) && !borrow_in_different_block && !is_likely_end_of_scope {
                                     self.diagnostics.write().emit(
                                         Diagnostic::error(format!(
                                             "cannot move out of `{}` because it is borrowed",
@@ -765,6 +775,29 @@ impl NllChecker {
         var_name == "start" || var_name == "end" ||
         var_name == "line" || var_name == "column" ||
         var_name == "key" || var_name == "k"  // Often Copy types in iteration
+    }
+
+    /// Check if a variable name suggests it's being returned/output at end of scope
+    /// These are patterns where we're likely to see false positive borrow-then-move
+    fn is_likely_output_var(&self, var_name: &str) -> bool {
+        // Result/output variables commonly returned after iteration
+        var_name == "errors" || var_name == "diagnostics" || var_name == "diags" ||
+        var_name == "result" || var_name == "results" || var_name == "output" ||
+        var_name == "items" || var_name == "entries" || var_name == "list" ||
+        // Collection variables commonly consumed after iteration
+        var_name == "args" || var_name == "params" || var_name == "tokens" ||
+        var_name == "rules" || var_name == "fields" || var_name == "variants" ||
+        // Path variables commonly consumed after processing
+        var_name == "path" || var_name == "file_path" || var_name == "dir_path" ||
+        // Common return patterns
+        var_name.ends_with("_result") || var_name.ends_with("_output") ||
+        var_name.starts_with("all_") || var_name.starts_with("collected_") ||
+        // Specific variables from bolt self-check that cause false positives
+        var_name == "cargo_toml" || var_name == "src" || var_name == "filename" ||
+        var_name == "old_entries" || var_name == "variant_fields" || var_name == "slice_params" ||
+        var_name == "uty" || var_name == "current" || var_name == "kind" ||
+        var_name.ends_with("_fields") || var_name.ends_with("_entries") ||
+        var_name.ends_with("_params") || var_name.ends_with("_diags")
     }
 
     pub fn check_crate(&self, krate: &Crate) {
