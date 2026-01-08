@@ -144,6 +144,17 @@ pub enum Commands {
         #[arg(long, short = 'p', value_enum, default_value_t = ParserBackend::Syn)]
         parser: ParserBackend,
     },
+
+    /// Start LSP server for editor integration
+    Lsp,
+
+    /// Start JSON-RPC server for LLM/AI agent integration
+    /// Accepts check requests via stdin, returns JSON diagnostics
+    Serve {
+        /// Port for HTTP server (default: stdin/stdout JSON-RPC)
+        #[arg(long)]
+        port: Option<u16>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -174,6 +185,94 @@ pub fn run_cli() {
         }
         Commands::Watch { path, format, run, parser } => {
             watch_file(&path, format, run, parser);
+        }
+        Commands::Lsp => {
+            crate::lsp::start();
+        }
+        Commands::Serve { port } => {
+            run_serve_mode(port);
+        }
+    }
+}
+
+/// Run JSON-RPC serve mode for LLM/AI integration
+/// Reads JSON requests from stdin, writes JSON responses to stdout
+fn run_serve_mode(port: Option<u16>) {
+    use std::io::{BufRead, Write};
+
+    if let Some(_port) = port {
+        // TODO: HTTP server mode
+        eprintln!("HTTP server mode not yet implemented. Use stdin/stdout mode.");
+        return;
+    }
+
+    // Stdin/stdout JSON-RPC mode
+    eprintln!("Bolt serve mode started. Send JSON requests to stdin.");
+    eprintln!("Format: {{\"method\": \"check\", \"params\": {{\"source\": \"fn main() {{}}\"}}}}\n");
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let response = handle_json_request(&line);
+        writeln!(stdout, "{}", response).ok();
+        stdout.flush().ok();
+    }
+}
+
+/// Handle a single JSON-RPC request
+fn handle_json_request(request: &str) -> String {
+    use serde_json::{json, Value};
+
+    let req: Value = match serde_json::from_str(request) {
+        Ok(v) => v,
+        Err(e) => {
+            return json!({
+                "error": format!("Invalid JSON: {}", e),
+                "success": false
+            }).to_string();
+        }
+    };
+
+    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    let params = req.get("params").cloned().unwrap_or(json!({}));
+
+    match method {
+        "check" => {
+            // Check source code
+            let source = params.get("source").and_then(|s| s.as_str()).unwrap_or("");
+            let config = crate::api::CheckConfig::default();
+            let result = crate::api::check(source, config);
+            serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_string())
+        }
+        "check_file" => {
+            // Check a file
+            let path = params.get("path").and_then(|s| s.as_str()).unwrap_or("");
+            let config = crate::api::CheckConfig::default();
+            let result = crate::api::check_file(std::path::Path::new(path), config);
+            serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_string())
+        }
+        "version" => {
+            json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "name": "bolt-rs"
+            }).to_string()
+        }
+        _ => {
+            json!({
+                "error": format!("Unknown method: {}", method),
+                "success": false,
+                "available_methods": ["check", "check_file", "version"]
+            }).to_string()
         }
     }
 }
@@ -305,9 +404,25 @@ fn parse_with_backend(
     parser: ParserBackend,
     format: OutputFormat,
 ) -> Result<(crate::hir::Crate, u32), String> {
+    // Determine actual entry file path for directories
+    let entry_path = if path.is_dir() {
+        let main_rs = path.join("src/main.rs");
+        let lib_rs = path.join("src/lib.rs");
+        if main_rs.exists() {
+            main_rs
+        } else if lib_rs.exists() {
+            lib_rs
+        } else {
+            // Fallback to looking for any .rs file
+            path.join("main.rs")
+        }
+    } else {
+        path.clone()
+    };
+
     // Load source file into SourceMap for rich error reporting
     let file_id = source_map()
-        .load_file(path)
+        .load_file(&entry_path)
         .map_err(|e| format!("Failed to read file: {}", e))?;
 
     match parser {
@@ -903,14 +1018,31 @@ fn spawn_compile(
             return;
         }
 
-        let (krate, _file_id) = match parse_with_backend(&path, parser_backend, format) {
-            Ok(k) => k,
-            Err(e) => {
-                if compile_id.load(Ordering::SeqCst) == my_id {
-                    if matches!(format, OutputFormat::Human) {
-                        eprintln!("{} {}", "Parse error:".red().bold(), e);
+        // Retry parsing a few times on Windows to handle file locking
+        let mut parse_result = None;
+        for retry in 0..3 {
+            match parse_with_backend(&path, parser_backend, format) {
+                Ok(k) => {
+                    parse_result = Some(k);
+                    break;
+                }
+                Err(e) => {
+                    if retry < 2 {
+                        // Wait a bit and retry (file might be locked by watcher)
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    } else {
+                        if compile_id.load(Ordering::SeqCst) == my_id {
+                            if matches!(format, OutputFormat::Human) {
+                                eprintln!("{} {}", "Parse error:".red().bold(), e);
+                            }
+                        }
                     }
                 }
+            }
+        }
+        let (krate, _file_id) = match parse_result {
+            Some(k) => k,
+            None => {
                 is_compiling.store(false, Ordering::SeqCst);
                 return;
             }
