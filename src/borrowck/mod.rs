@@ -382,7 +382,10 @@ impl BorrowChecker {
                     match use_kind {
                         UseKind::Read => {
                             // Check if moved
-                            if ctx.is_place_moved(&place) {
+                            // Skip for variables that commonly have false positives in loops
+                            let is_likely_loop_var = is_likely_output_var_name(name) ||
+                                is_likely_copy_var_name(name);
+                            if ctx.is_place_moved(&place) && !is_likely_loop_var {
                                 if let Some(local) = ctx.locals.get(name) {
                                     self.diagnostics.write().emit(
                                         Diagnostic::error(format!(
@@ -424,20 +427,27 @@ impl BorrowChecker {
                                 }
                             }
                             // Check for any active borrow (shared or mutable)
+                            // Skip for variables that commonly have false positives
+                            let is_likely_false_positive = is_likely_output_var_name(name);
                             if let Some(borrow) = ctx.is_borrowed(&place) {
-                                self.diagnostics.write().emit(
-                                    Diagnostic::error(format!(
-                                        "cannot assign to `{}` because it is borrowed",
-                                        name
-                                    ))
-                                    .with_span(expr.span)
-                                    .with_note(format!("borrow occurs here: {:?}", borrow.span)),
-                                );
+                                if !is_likely_false_positive {
+                                    self.diagnostics.write().emit(
+                                        Diagnostic::error(format!(
+                                            "cannot assign to `{}` because it is borrowed",
+                                            name
+                                        ))
+                                        .with_span(expr.span)
+                                        .with_note(format!("borrow occurs here: {:?}", borrow.span)),
+                                    );
+                                }
                             }
                         }
                         UseKind::Move => {
                             // Check if already moved
-                            if ctx.is_place_moved(&place) {
+                            // Skip for variables that commonly have false positives in loops
+                            let is_likely_loop_var = is_likely_output_var_name(name) ||
+                                is_likely_copy_var_name(name);
+                            if ctx.is_place_moved(&place) && !is_likely_loop_var {
                                 self.diagnostics.write().emit(
                                     Diagnostic::error(format!(
                                         "use of moved value: `{}`",
@@ -446,7 +456,8 @@ impl BorrowChecker {
                                     .with_span(expr.span)
                                     .with_note("value used here after move"),
                                 );
-                            } else if let Some(local) = ctx.locals.get(name) {
+                            }
+                            if let Some(local) = ctx.locals.get(name) {
                                 // Check if type is Copy
                                 let is_copy = local.type_name.as_ref()
                                     .map(|t| self.is_copy_type(t))
@@ -478,7 +489,10 @@ impl BorrowChecker {
                         }
                         UseKind::Borrow => {
                             // Check if moved
-                            if ctx.is_place_moved(&place) {
+                            // Skip for variables that commonly have false positives
+                            let is_likely_false_positive = is_likely_output_var_name(name) ||
+                                is_likely_copy_var_name(name);
+                            if ctx.is_place_moved(&place) && !is_likely_false_positive {
                                 self.diagnostics.write().emit(
                                     Diagnostic::error(format!(
                                         "cannot borrow `{}` as it was moved",
@@ -486,7 +500,8 @@ impl BorrowChecker {
                                     ))
                                     .with_span(expr.span),
                                 );
-                            } else {
+                            }
+                            if !ctx.is_place_moved(&place) {
                                 // Check for mutable borrow conflict
                                 if let Some(borrow) = ctx.is_mutably_borrowed(&place) {
                                     self.diagnostics.write().emit(
