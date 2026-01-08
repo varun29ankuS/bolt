@@ -8,6 +8,7 @@
 //! The resolver tries stubs first, then falls back to rlib reading.
 
 pub mod rlib;
+pub mod source;
 pub mod stubs;
 
 use crate::cargo::Project;
@@ -17,6 +18,7 @@ use parking_lot::RwLock;
 
 pub use stubs::{global_stubs, StubRegistry, TraitStub, TypeStub, MethodStub};
 pub use rlib::{global_rlib_cache, RlibCache, RlibMetadata};
+pub use source::{global_dependency_cache, DependencyCache, ParsedCrate, TypeInfo, TraitInfo};
 
 /// Result of resolving an external item
 #[derive(Debug, Clone)]

@@ -763,9 +763,13 @@ impl CodeGenerator {
         }
 
         // Only add return type if function doesn't return unit
+        // Exception: main() always returns i64 for exit code
         if !matches!(func.sig.output.kind, TypeKind::Unit) {
             let ret_ty = self.type_to_cl(&func.sig.output);
             sig.returns.push(AbiParam::new(ret_ty));
+        } else if name == "main" {
+            // main() returns i64 exit code even if declared as -> ()
+            sig.returns.push(AbiParam::new(types::I64));
         }
 
         let func_id = self
@@ -893,11 +897,18 @@ impl CodeGenerator {
         // Save sret_ptr before translation (struct expressions will clear it after use)
         let original_sret = translator.sret_ptr;
 
+        // main() is special - always returns i64 exit code
+        let is_main = name == "main";
+
         if let Some(ref body) = func.body {
             let result = translator.translate_block(body);
-            if returns_unit {
+            if returns_unit && !is_main {
                 // Unit-returning function: no return value
                 translator.builder.ins().return_(&[]);
+            } else if returns_unit && is_main {
+                // main() returns 0 for success
+                let zero = translator.builder.ins().iconst(types::I64, 0);
+                translator.builder.ins().return_(&[zero]);
             } else if let Some(val) = result {
                 // If this function returns a struct, return the sret pointer
                 if let Some(sret) = original_sret {
@@ -920,8 +931,11 @@ impl CodeGenerator {
                 translator.builder.ins().return_(&[zero]);
             }
         } else {
-            if returns_unit {
+            if returns_unit && !is_main {
                 translator.builder.ins().return_(&[]);
+            } else if returns_unit && is_main {
+                let zero = translator.builder.ins().iconst(types::I64, 0);
+                translator.builder.ins().return_(&[zero]);
             } else {
                 let zero = if return_type == types::F64 {
                     translator.builder.ins().f64const(0.0)

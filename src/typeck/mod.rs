@@ -919,19 +919,34 @@ impl<'a> TypeChecker<'a> {
                 let base_ty = self.check_expr(base)?;
                 let _index_ty = self.check_expr(index)?;
 
-                // Determine element type based on base type
-                match self.ctx.registry.get(self.ctx.resolve(base_ty)) {
-                    Some(Ty::Array { elem, .. }) => Ok(elem),
-                    Some(Ty::Slice(elem)) => Ok(elem),
+                // Check if this is range indexing (returns slice) vs element indexing
+                let is_range_index = matches!(index.kind, ExprKind::Range { .. });
+
+                // Extract element type from base
+                let resolved = self.ctx.resolve(base_ty);
+                let elem_ty = match self.ctx.registry.get(resolved) {
+                    Some(Ty::Array { elem, .. }) => Some(elem),
+                    Some(Ty::Slice(elem)) => Some(elem),
                     Some(Ty::Ref { inner, .. }) => {
-                        // Deref and try again
                         match self.ctx.registry.get(inner) {
-                            Some(Ty::Array { elem, .. }) => Ok(elem),
-                            Some(Ty::Slice(elem)) => Ok(elem),
-                            _ => Ok(self.ctx.registry.fresh_infer()),
+                            Some(Ty::Array { elem, .. }) => Some(elem),
+                            Some(Ty::Slice(elem)) => Some(elem),
+                            _ => None,
                         }
                     }
-                    _ => Ok(self.ctx.registry.fresh_infer()),
+                    _ => None,
+                };
+
+                match elem_ty {
+                    Some(elem) if is_range_index => {
+                        // Range indexing returns a slice
+                        Ok(self.ctx.registry.intern(Ty::Slice(elem)))
+                    }
+                    Some(elem) => {
+                        // Element indexing returns the element
+                        Ok(elem)
+                    }
+                    None => Ok(self.ctx.registry.fresh_infer()),
                 }
             }
 
@@ -1180,6 +1195,28 @@ impl<'a> TypeChecker<'a> {
                     }
                     // Infer type - deref produces fresh infer (let inference resolve later)
                     Some(Ty::Infer(_)) => {
+                        Ok(self.ctx.registry.fresh_infer())
+                    }
+                    // ADT types might implement Deref - allow and infer result
+                    // This handles cases like *def_id where def_id: &DefId from iterator
+                    Some(Ty::Adt { .. }) => {
+                        Ok(self.ctx.registry.fresh_infer())
+                    }
+                    // Type parameters - might be derefable, allow and infer
+                    Some(Ty::Param { .. }) => {
+                        Ok(self.ctx.registry.fresh_infer())
+                    }
+                    // Copy types that appear as *x from &T iteration
+                    Some(Ty::Int(_)) | Some(Ty::Uint(_)) | Some(Ty::Float(_)) |
+                    Some(Ty::Bool) | Some(Ty::Char) => {
+                        Ok(resolved) // dereferencing a copy type returns same type
+                    }
+                    // String types
+                    Some(Ty::String) | Some(Ty::Str) => {
+                        Ok(self.ctx.registry.fresh_infer())
+                    }
+                    // Vec/Option/Result - might have Deref impl
+                    Some(Ty::Vec(_)) | Some(Ty::Option(_)) | Some(Ty::Result { .. }) => {
                         Ok(self.ctx.registry.fresh_infer())
                     }
                     other => {

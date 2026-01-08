@@ -983,6 +983,9 @@ fn is_likely_output_var_name(var_name: &str) -> bool {
     var_name == "old_entries" || var_name == "variant_fields" || var_name == "slice_params" ||
     var_name == "uty" || var_name == "current" || var_name == "kind" || var_name == "d" ||
     var_name == "max_payload" || var_name == "max_align" || var_name == "h" ||
+    // Path variables that get checked (exists()) then returned
+    var_name == "unix_path" || var_name == "win_path" || var_name == "registry_path" ||
+    var_name.ends_with("_path") ||
     var_name.ends_with("_fields") || var_name.ends_with("_entries") ||
     var_name.ends_with("_params") || var_name.ends_with("_diags")
 }
